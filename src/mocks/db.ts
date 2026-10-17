@@ -24,8 +24,16 @@ import {
 const STORAGE_KEY = 'kurio_mock_db_v1'
 const FAVORITES_STORAGE_KEY = 'kurio_mock_favorites_v1'
 const CART_STORAGE_KEY = 'kurio_mock_carts_v1'
-const AUTH_STORAGE_KEY = 'kurio_mock_auth_v1'
-const ORDERS_STORAGE_KEY = 'kurio_mock_orders_v1'
+// v2: senhas migraram de FNV-1a para PBKDF2 e pedidos guardam a impressão digital exata do payload.
+const AUTH_STORAGE_KEY = 'kurio_mock_auth_v2'
+const ORDERS_STORAGE_KEY = 'kurio_mock_orders_v2'
+
+// Hashes PBKDF2-SHA256 (100.000 iterações, salt fixo apenas nas fixtures) da senha fictícia "Kurio@2026".
+const FIXTURE_PASSWORD_HASHES = {
+  nova: 'pbkdf2-sha256$100000$a3VyaW8tbm92YS1zYXRvIQ==$udC5nv07MDEYMr3v/yQk+4CLXvjPLX7iJRF0MlqQIA0=',
+  kael: 'pbkdf2-sha256$100000$a3VyaW8ta2FlbC12YW5jZQ==$tVXFjC+uj42ceyDeXhIBSaEGS7WrSc9QJr42G2jf8so=',
+} as const
+const PASSWORD_HASH_ITERATIONS = 100_000
 
 interface StoredMockUser {
   profile: UserProfileDto
@@ -45,7 +53,8 @@ interface StoredAuthState {
 
 interface StoredMockOrder {
   order: OrderDto
-  payloadHash: string
+  /** Representação canônica do payload; comparação exata em vez de hash curto. */
+  payloadFingerprint: string
 }
 
 interface StoredCartItem {
@@ -145,6 +154,7 @@ const originalFixtures: NftItem[] = [
     imageUrl: '/mock-assets/nfts/ape-cosmic.png',
     galleryUrls: ['/mock-assets/nfts/ape-cosmic.png'],
     isRare: true,
+    isFeatured: true,
     rating: 4.9,
     reviewsCount: 92,
     description: 'Escultura digital neon em edição rara.',
@@ -222,6 +232,7 @@ const originalFixtures: NftItem[] = [
     imageUrl: '/mock-assets/nfts/ape-ivory.png',
     galleryUrls: ['/mock-assets/nfts/ape-ivory.png'],
     isRare: true,
+    isFeatured: true,
     rating: 4.9,
     reviewsCount: 106,
     description: 'Retrato fotográfico raro em edição limitada.',
@@ -322,7 +333,6 @@ const originalFixtures: NftItem[] = [
     totalEditions: 10,
     imageUrl: '/mock-assets/nfts/ape-emerald.png',
     galleryUrls: ['/mock-assets/nfts/ape-emerald.png'],
-    isFeatured: true,
     rating: 4.8,
     reviewsCount: 47,
     description: 'Passe de assinatura para a comunidade KURIO.',
@@ -532,19 +542,82 @@ const originalFixtures: NftItem[] = [
   },
 ]
 
-let inMemoryItems = structuredClone(originalFixtures)
-let inMemoryFavorites: Record<string, string[]> = {}
-let inMemoryCarts: Record<string, StoredCart> = {}
-let inMemoryAuth: StoredAuthState | undefined
-let inMemoryOrders: StoredMockOrder[] | undefined
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = ''
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  return btoa(binary)
+}
 
-function hashMockPassword(password: string): string {
+function base64ToBytes(value: string): Uint8Array<ArrayBuffer> {
+  const binary = atob(value)
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index)
+  }
+  return bytes
+}
+
+async function derivePasswordHash(
+  password: string,
+  salt: Uint8Array<ArrayBuffer>,
+  iterations: number,
+): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(password),
+    'PBKDF2',
+    false,
+    ['deriveBits'],
+  )
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', hash: 'SHA-256', salt, iterations },
+    key,
+    256,
+  )
+  return bytesToBase64(new Uint8Array(bits))
+}
+
+/** PBKDF2-SHA256 com salt aleatório por senha; nunca armazena a senha em claro. */
+async function hashMockPassword(password: string): Promise<string> {
+  const salt = crypto.getRandomValues(new Uint8Array(16))
+  const hash = await derivePasswordHash(password, salt, PASSWORD_HASH_ITERATIONS)
+  return `pbkdf2-sha256$${PASSWORD_HASH_ITERATIONS}$${bytesToBase64(salt)}$${hash}`
+}
+
+async function verifyMockPassword(
+  password: string,
+  storedHash: string,
+): Promise<boolean> {
+  const [scheme, iterationsText, saltText, expectedHash] = storedHash.split('$')
+  const iterations = Number(iterationsText)
+  if (
+    scheme !== 'pbkdf2-sha256' ||
+    !Number.isSafeInteger(iterations) ||
+    !saltText ||
+    !expectedHash
+  ) {
+    return false
+  }
+  const actualHash = await derivePasswordHash(
+    password,
+    base64ToBytes(saltText),
+    iterations,
+  )
+  // Comparação em tempo constante para não vazar o prefixo correto do hash.
+  let difference = actualHash.length ^ expectedHash.length
+  for (let index = 0; index < expectedHash.length; index += 1) {
+    difference |= actualHash.charCodeAt(index) ^ expectedHash.charCodeAt(index)
+  }
+  return difference === 0
+}
+
+function fnv1a(value: string): string {
   let hash = 2166136261
-  for (let index = 0; index < password.length; index += 1) {
-    hash ^= password.charCodeAt(index)
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index)
     hash = Math.imul(hash, 16777619)
   }
-  return `fnv1a-${(hash >>> 0).toString(16).padStart(8, '0')}`
+  return (hash >>> 0).toString(16).padStart(8, '0')
 }
 
 function createAuthFixtures(): StoredAuthState {
@@ -558,6 +631,7 @@ function createAuthFixtures(): StoredAuthState {
     primaryAddress: string,
     reserveAddress: string,
     reserveProvider: WalletDto['walletType'],
+    passwordHash: string,
   ): StoredMockUser => {
     const profile: UserProfileDto = {
       id,
@@ -579,7 +653,7 @@ function createAuthFixtures(): StoredAuthState {
     }
     return {
       profile,
-      passwordHash: hashMockPassword('Kurio@2026'),
+      passwordHash,
       wallets: [
         {
           id: `${id}-wallet-primary`,
@@ -618,8 +692,9 @@ function createAuthFixtures(): StoredAuthState {
         'nova.kurio',
         'Kurio Vault',
         '0xA91F...E82C',
-        'nova.kurio.eth',
+        '0xC3D2...41AF',
         'Coinbase Wallet',
+        FIXTURE_PASSWORD_HASHES.nova,
       ),
       makeUser(
         'user-kael-vance',
@@ -629,40 +704,77 @@ function createAuthFixtures(): StoredAuthState {
         'kael.kurio',
         'Vance Cold',
         '0xB82A...F91D',
-        'kael.kurio.eth',
+        '0xD4E5...52BA',
         'Coinbase Wallet',
+        FIXTURE_PASSWORD_HASHES.kael,
       ),
     ],
     sessions: {},
   }
 }
 
+function parseStoredJson(serialized: string): unknown {
+  try {
+    return JSON.parse(serialized)
+  } catch {
+    return undefined
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function hasStringFields(value: Record<string, unknown>, fields: string[]): boolean {
+  return fields.every((field) => typeof value[field] === 'string')
+}
+
+function isStoredEth(value: unknown): value is string {
+  return typeof value === 'string' && /^\d+(?:\.\d{1,18})?$/.test(value)
+}
+
+function isStoredWallet(value: unknown): value is WalletDto {
+  return isRecord(value) && hasStringFields(value, [
+    'id', 'userId', 'label', 'displayName', 'walletNickname', 'network',
+    'profileName', 'address', 'walletType', 'referralCode', 'email', 'ensName', 'ensDomain',
+  ]) && typeof value.isPrimary === 'boolean'
+}
+
+function isStoredProfile(value: unknown): value is UserProfileDto {
+  return isRecord(value) && hasStringFields(value, [
+    'id', 'displayName', 'username', 'email', 'ensName', 'ensDomain', 'walletNickname',
+  ]) && (value.avatarUrl === null || typeof value.avatarUrl === 'string')
+}
+
+function isStoredAuthState(value: unknown): value is StoredAuthState {
+  return (
+    isRecord(value) &&
+    Array.isArray(value.users) &&
+    value.users.every((user: unknown) =>
+      isRecord(user) && isStoredProfile(user.profile) &&
+      typeof user.passwordHash === 'string' &&
+      Array.isArray(user.wallets) && user.wallets.every(isStoredWallet),
+    ) &&
+    isRecord(value.sessions) &&
+    Object.values(value.sessions).every((session: unknown) =>
+      isRecord(session) && typeof session.userId === 'string' &&
+      typeof session.expiresAt === 'string' && Number.isFinite(Date.parse(session.expiresAt)),
+    )
+  )
+}
+
+// Lê sempre do localStorage: abas diferentes enxergam o mesmo banco simulado.
+// Dados corrompidos são descartados e a tabela volta às fixtures.
 function getAuthState(): StoredAuthState {
-  if (inMemoryAuth) return inMemoryAuth
   const serialized = getStorage()?.getItem(AUTH_STORAGE_KEY)
-  if (!serialized) {
-    inMemoryAuth = createAuthFixtures()
-    getStorage()?.setItem(AUTH_STORAGE_KEY, JSON.stringify(inMemoryAuth))
-    return inMemoryAuth
-  }
-  const parsed: unknown = JSON.parse(serialized)
-  if (
-    typeof parsed !== 'object' ||
-    parsed === null ||
-    !('users' in parsed) ||
-    !Array.isArray(parsed.users) ||
-    !('sessions' in parsed) ||
-    typeof parsed.sessions !== 'object' ||
-    parsed.sessions === null
-  ) {
-    throw new TypeError('A tabela local de autenticação contém dados inválidos.')
-  }
-  inMemoryAuth = parsed as StoredAuthState
-  return inMemoryAuth
+  const parsed = serialized ? parseStoredJson(serialized) : undefined
+  if (isStoredAuthState(parsed)) return parsed
+  const fixtures = createAuthFixtures()
+  saveAuthState(fixtures)
+  return fixtures
 }
 
 function saveAuthState(state: StoredAuthState): void {
-  inMemoryAuth = state
   getStorage()?.setItem(AUTH_STORAGE_KEY, JSON.stringify(state))
 }
 
@@ -681,16 +793,18 @@ function createMockSession(user: StoredMockUser): {
   }
 }
 
-export function authenticateMockUser(
+export async function authenticateMockUser(
   email: string,
   password: string,
-): { session: AuthSessionDto; wallets: WalletDto[] } | null {
+): Promise<{ session: AuthSessionDto; wallets: WalletDto[] } | null> {
+  const normalizedEmail = email.trim().toLocaleLowerCase()
   const user = getAuthState().users.find(
-    (entry) =>
-      entry.profile.email.toLocaleLowerCase() === email.trim().toLocaleLowerCase() &&
-      entry.passwordHash === hashMockPassword(password),
+    (entry) => entry.profile.email.toLocaleLowerCase() === normalizedEmail,
   )
-  return user ? createMockSession(user) : null
+  if (!user || !(await verifyMockPassword(password, user.passwordHash))) {
+    return null
+  }
+  return createMockSession(user)
 }
 
 export function findMockUserByEmailOrUsername(
@@ -710,11 +824,12 @@ export function findMockUserByEmailOrUsername(
     : 'username'
 }
 
-export function registerMockUser(input: {
+export async function registerMockUser(input: {
   username: string
   email: string
   password: string
-}): { session: AuthSessionDto; wallets: WalletDto[] } {
+}): Promise<{ session: AuthSessionDto; wallets: WalletDto[] }> {
+  const passwordHash = await hashMockPassword(input.password)
   const auth = getAuthState()
   const user: StoredMockUser = {
     profile: {
@@ -727,7 +842,7 @@ export function registerMockUser(input: {
       walletNickname: 'Minha carteira',
       avatarUrl: null,
     },
-    passwordHash: hashMockPassword(input.password),
+    passwordHash,
     wallets: [],
   }
   auth.users.push(user)
@@ -813,17 +928,20 @@ export function updateMockProfile(
   return structuredClone(user.profile)
 }
 
-export function updateMockPassword(
+export async function updateMockPassword(
   userId: string,
   currentPassword: string,
   newPassword: string,
-): boolean {
-  const auth = getAuthState()
-  const user = auth.users.find((entry) => entry.profile.id === userId)
-  if (!user || user.passwordHash !== hashMockPassword(currentPassword)) {
+): Promise<boolean> {
+  const current = getAuthState().users.find((entry) => entry.profile.id === userId)
+  if (!current || !(await verifyMockPassword(currentPassword, current.passwordHash))) {
     return false
   }
-  user.passwordHash = hashMockPassword(newPassword)
+  const newHash = await hashMockPassword(newPassword)
+  const auth = getAuthState()
+  const user = auth.users.find((entry) => entry.profile.id === userId)
+  if (!user) return false
+  user.passwordHash = newHash
   saveAuthState(auth)
   return true
 }
@@ -961,9 +1079,8 @@ export function mergeMockGuestCart(guestId: string, userId: string): void {
       (existing?.quantity ?? 0) + guestItem.quantity,
     )
     if (existing) {
+      // Mantém o preço já visto pelo usuário: mudanças seguem exigindo confirmação explícita.
       existing.quantity = quantity
-      existing.addedPriceEth = nft.priceEth
-      existing.addedVersion = nft.version
     } else {
       userCart.items.push({
         ...guestItem,
@@ -980,7 +1097,6 @@ export function mergeMockGuestCart(guestId: string, userId: string): void {
 }
 
 export function resetMockAuth(): void {
-  inMemoryAuth = createAuthFixtures()
   getStorage()?.removeItem(AUTH_STORAGE_KEY)
 }
 
@@ -988,70 +1104,86 @@ function getStorage(): Storage | null {
   return typeof window === 'undefined' ? null : window.localStorage
 }
 
+function isStoredNftList(value: unknown): value is NftItem[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (item: unknown) =>
+        isRecord(item) && hasStringFields(item, [
+          'id', 'tokenId', 'slug', 'title', 'collectionName', 'category', 'network',
+          'editionType', 'imageUrl', 'description', 'longDescription', 'contractAddress', 'updatedAt',
+        ]) && isStoredEth(item.priceEth) &&
+        (item.originalPriceEth === undefined || isStoredEth(item.originalPriceEth)) &&
+        Number.isSafeInteger(item.version) && Number.isSafeInteger(item.availableEditions) &&
+        Number.isSafeInteger(item.totalEditions) && typeof item.rating === 'number' &&
+        Number.isFinite(item.rating) && typeof item.reviewsCount === 'number' &&
+        typeof item.creatorRoyaltyPercent === 'number' &&
+        Array.isArray(item.galleryUrls) && item.galleryUrls.every((url: unknown) => typeof url === 'string') &&
+        Array.isArray(item.attributes) && item.attributes.every((attribute: unknown) => typeof attribute === 'string'),
+    )
+  )
+}
+
 export function getMockNfts(): NftItem[] {
   const storage = getStorage()
   const serialized = storage?.getItem(STORAGE_KEY)
-  if (!serialized) {
-    storage?.setItem(STORAGE_KEY, JSON.stringify(inMemoryItems))
-    return inMemoryItems
-  }
-
-  const parsed: unknown = JSON.parse(serialized)
-  if (
-    !Array.isArray(parsed) ||
-    !parsed.every(
-      (item): item is NftItem =>
-        typeof item === 'object' &&
-        item !== null &&
-        'id' in item &&
-        'priceEth' in item &&
-        'version' in item,
-    )
-  ) {
-    throw new TypeError('O banco de dados local do mock contém dados inválidos.')
+  const parsed = serialized ? parseStoredJson(serialized) : undefined
+  if (!isStoredNftList(parsed)) {
+    const seeded = structuredClone(originalFixtures)
+    storage?.setItem(STORAGE_KEY, JSON.stringify(seeded))
+    return seeded
   }
 
   const storedIds = new Set(parsed.map((item) => item.id))
   const addedFixtures = originalFixtures.filter((item) => !storedIds.has(item.id))
-  inMemoryItems =
-    addedFixtures.length > 0
-      ? [...parsed, ...structuredClone(addedFixtures)]
-      : parsed
-  if (addedFixtures.length > 0) {
-    storage?.setItem(STORAGE_KEY, JSON.stringify(inMemoryItems))
-  }
-  return inMemoryItems
+  if (addedFixtures.length === 0) return parsed
+  const merged = [...parsed, ...structuredClone(addedFixtures)]
+  storage?.setItem(STORAGE_KEY, JSON.stringify(merged))
+  return merged
 }
 
 export function saveMockNfts(items: NftItem[]): void {
-  inMemoryItems = items
   getStorage()?.setItem(STORAGE_KEY, JSON.stringify(items))
 }
 
-function getMockFavoriteTable(): Record<string, string[]> {
-  const storage = getStorage()
-  const serialized = storage?.getItem(FAVORITES_STORAGE_KEY)
-  if (!serialized) {
-    storage?.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(inMemoryFavorites))
-    return inMemoryFavorites
+/** Aplica uma mudança de preço/disponibilidade e incrementa a versão monotônica do NFT. */
+export function updateMockNft(
+  nftId: string,
+  changes: { priceEth?: string; availableEditions?: number },
+): NftItem | null {
+  const items = getMockNfts()
+  const current = items.find((item) => item.id === nftId)
+  if (!current) return null
+  const updated: NftItem = {
+    ...current,
+    ...(changes.priceEth !== undefined ? { priceEth: changes.priceEth } : {}),
+    ...(changes.availableEditions !== undefined
+      ? { availableEditions: changes.availableEditions }
+      : {}),
+    version: current.version + 1,
+    updatedAt: new Date().toISOString(),
   }
+  saveMockNfts(items.map((item) => (item.id === nftId ? updated : item)))
+  return updated
+}
 
-  const parsed: unknown = JSON.parse(serialized)
-  if (
-    typeof parsed !== 'object' ||
-    parsed === null ||
-    Array.isArray(parsed) ||
-    !Object.values(parsed).every(
+function isFavoriteTable(value: unknown): value is Record<string, string[]> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    Object.values(value).every(
       (ids) =>
         Array.isArray(ids) &&
         ids.every((id): id is string => typeof id === 'string'),
     )
-  ) {
-    throw new TypeError('A tabela local de favoritos contém dados inválidos.')
-  }
+  )
+}
 
-  inMemoryFavorites = parsed as Record<string, string[]>
-  return inMemoryFavorites
+function getMockFavoriteTable(): Record<string, string[]> {
+  const serialized = getStorage()?.getItem(FAVORITES_STORAGE_KEY)
+  const parsed = serialized ? parseStoredJson(serialized) : undefined
+  return isFavoriteTable(parsed) ? parsed : {}
 }
 
 export function getMockFavorites(sessionId: string): string[] {
@@ -1069,38 +1201,32 @@ export function saveMockFavorites(
 }
 
 export function resetMockFavorites(): void {
-  inMemoryFavorites = {}
   getStorage()?.removeItem(FAVORITES_STORAGE_KEY)
 }
 
-function getMockCartTable(): Record<string, StoredCart> {
-  const storage = getStorage()
-  const serialized = storage?.getItem(CART_STORAGE_KEY)
-  if (!serialized) {
-    storage?.setItem(CART_STORAGE_KEY, JSON.stringify(inMemoryCarts))
-    return inMemoryCarts
-  }
-
-  const parsed: unknown = JSON.parse(serialized)
-  if (
-    typeof parsed !== 'object' ||
-    parsed === null ||
-    Array.isArray(parsed) ||
-    !Object.values(parsed).every(
-      (cart) =>
-        typeof cart === 'object' &&
-        cart !== null &&
-        'items' in cart &&
+function isCartTable(value: unknown): value is Record<string, StoredCart> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    Object.values(value).every(
+      (cart: unknown) =>
+        isRecord(cart) &&
         Array.isArray(cart.items) &&
-        'couponCode' in cart &&
-        (cart.couponCode === null || typeof cart.couponCode === 'string'),
+        cart.items.every((item: unknown) =>
+          isRecord(item) && hasStringFields(item, ['itemId', 'nftId', 'editionType']) &&
+          typeof item.quantity === 'number' && Number.isSafeInteger(item.quantity) && item.quantity > 0 &&
+          Number.isSafeInteger(item.addedVersion) && isStoredEth(item.addedPriceEth),
+        ) &&
+        (cart.couponCode === null || cart.couponCode === 'KURIO10' || cart.couponCode === 'LANCAMENTO1ETH'),
     )
-  ) {
-    throw new TypeError('A tabela local de carrinhos contém dados inválidos.')
-  }
+  )
+}
 
-  inMemoryCarts = parsed as Record<string, StoredCart>
-  return inMemoryCarts
+function getMockCartTable(): Record<string, StoredCart> {
+  const serialized = getStorage()?.getItem(CART_STORAGE_KEY)
+  const parsed = serialized ? parseStoredJson(serialized) : undefined
+  return isCartTable(parsed) ? parsed : {}
 }
 
 function saveMockCart(sessionKey: string, cart: StoredCart): void {
@@ -1109,41 +1235,46 @@ function saveMockCart(sessionKey: string, cart: StoredCart): void {
   getStorage()?.setItem(CART_STORAGE_KEY, JSON.stringify(carts))
 }
 
-function getMockOrderTable(): StoredMockOrder[] {
-  if (inMemoryOrders) return inMemoryOrders
-  const serialized = getStorage()?.getItem(ORDERS_STORAGE_KEY)
-  if (!serialized) {
-    inMemoryOrders = []
-    getStorage()?.setItem(ORDERS_STORAGE_KEY, JSON.stringify(inMemoryOrders))
-    return inMemoryOrders
-  }
-  const parsed: unknown = JSON.parse(serialized)
-  if (
-    !Array.isArray(parsed) ||
-    !parsed.every(
-      (entry) =>
-        typeof entry === 'object' &&
-        entry !== null &&
-        'payloadHash' in entry &&
-        typeof entry.payloadHash === 'string' &&
-        'order' in entry &&
-        typeof entry.order === 'object' &&
-        entry.order !== null,
+function isOrderTable(value: unknown): value is StoredMockOrder[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (entry: unknown) =>
+        isRecord(entry) &&
+        typeof entry.payloadFingerprint === 'string' &&
+        isRecord(entry.order) &&
+        hasStringFields(entry.order, ['id', 'userId', 'idempotencyKey', 'createdAt', 'updatedAt', 'transactionHash', 'network', 'walletProvider']) &&
+        Number.isSafeInteger(entry.order.version) &&
+        ['pending', 'confirmed', 'declined'].includes(String(entry.order.status)) &&
+        isRecord(entry.order.collector) && typeof entry.order.collector.walletAddress === 'string' &&
+        isRecord(entry.order.snapshot) &&
+        isStoredEth(entry.order.snapshot.subtotalEth) &&
+        isStoredEth(entry.order.snapshot.discountEth) &&
+        isStoredEth(entry.order.snapshot.networkFeeEth) &&
+        isStoredEth(entry.order.snapshot.totalEth) &&
+        Array.isArray(entry.order.snapshot.items) &&
+        entry.order.snapshot.items.every((item: unknown) =>
+          isRecord(item) && hasStringFields(item, ['nftId', 'tokenId', 'title', 'imageUrl', 'editionType']) &&
+          typeof item.quantity === 'number' && Number.isSafeInteger(item.quantity) && item.quantity > 0 &&
+          isStoredEth(item.unitPriceEth) && isStoredEth(item.subtotalEth),
+        ),
     )
-  ) {
-    throw new TypeError('A tabela local de pedidos contém dados inválidos.')
-  }
-  inMemoryOrders = parsed as StoredMockOrder[]
-  return inMemoryOrders
+  )
+}
+
+function getMockOrderTable(): StoredMockOrder[] {
+  const serialized = getStorage()?.getItem(ORDERS_STORAGE_KEY)
+  const parsed = serialized ? parseStoredJson(serialized) : undefined
+  return isOrderTable(parsed) ? parsed : []
 }
 
 function saveMockOrders(orders: StoredMockOrder[]): void {
-  inMemoryOrders = orders
   getStorage()?.setItem(ORDERS_STORAGE_KEY, JSON.stringify(orders))
 }
 
-function hashOrderPayload(input: CreateOrderRequestDto): string {
-  const payload = JSON.stringify({
+/** Forma canônica do payload do pedido: base da comparação de idempotência. */
+function fingerprintOrderPayload(input: CreateOrderRequestDto): string {
+  return JSON.stringify({
     quoteVersion: input.quoteVersion,
     walletProvider: input.walletProvider,
     network: input.network,
@@ -1163,12 +1294,6 @@ function hashOrderPayload(input: CreateOrderRequestDto): string {
       notes: input.collector.notes ?? '',
     },
   })
-  let hash = 2166136261
-  for (let index = 0; index < payload.length; index += 1) {
-    hash ^= payload.charCodeAt(index)
-    hash = Math.imul(hash, 16777619)
-  }
-  return `fnv1a-${(hash >>> 0).toString(16).padStart(8, '0')}`
 }
 
 function getQuoteVersion(sessionKey: string, cart: CartDto): string {
@@ -1185,12 +1310,7 @@ function getQuoteVersion(sessionKey: string, cart: CartDto): string {
     .sort()
     .join('|')
   const value = `${sessionKey}|${versionData}|${cart.couponCode ?? ''}|${cart.subtotalEth}|${cart.discountEth}|${cart.networkFeeEth}|${cart.totalEth}`
-  let hash = 2166136261
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index)
-    hash = Math.imul(hash, 16777619)
-  }
-  return `quote-${(hash >>> 0).toString(16).padStart(8, '0')}`
+  return `quote-${fnv1a(value)}`
 }
 
 function getStoredCart(sessionKey: string): StoredCart {
@@ -1292,7 +1412,7 @@ export function getMockCheckoutQuote(userId: string): CheckoutQuoteDto {
 export function getMockOrderByIdempotencyKey(
   userId: string,
   idempotencyKey: string,
-): { order: OrderDto; payloadHash: string } | null {
+): { order: OrderDto; payloadFingerprint: string } | null {
   const found = getMockOrderTable().find(
     (entry) =>
       entry.order.userId === userId &&
@@ -1308,6 +1428,21 @@ export function getMockOrder(userId: string, orderId: string): OrderDto | null {
   return entry ? structuredClone(entry.order) : null
 }
 
+/** Dono de um pedido (ou null): permite responder 403 em vez de 404 a outro usuário. */
+export function getMockOrderOwnerId(orderId: string): string | null {
+  return (
+    getMockOrderTable().find((entry) => entry.order.id === orderId)?.order
+      .userId ?? null
+  )
+}
+
+/** Pedidos pendentes de todos os usuários; usados para retomar a simulação após recarregar. */
+export function listMockPendingOrders(): OrderDto[] {
+  return getMockOrderTable()
+    .filter((entry) => entry.order.status === 'pending')
+    .map((entry) => structuredClone(entry.order))
+}
+
 export function getMockOrders(userId: string): OrderDto[] {
   return getMockOrderTable()
     .filter((entry) => entry.order.userId === userId)
@@ -1320,6 +1455,7 @@ export type CreateMockOrderResult =
   | { kind: 'replayed'; order: OrderDto }
   | { kind: 'idempotency-conflict' }
   | { kind: 'stale' }
+  | { kind: 'unavailable'; message: string }
   | { kind: 'invalid-cart'; message: string }
 
 export function createMockOrder(
@@ -1328,30 +1464,28 @@ export function createMockOrder(
   input: CreateOrderRequestDto,
   status: OrderStatus,
 ): CreateMockOrderResult {
-  const payloadHash = hashOrderPayload(input)
+  const payloadFingerprint = fingerprintOrderPayload(input)
   const existing = getMockOrderByIdempotencyKey(userId, idempotencyKey)
   if (existing) {
-    if (existing.payloadHash !== payloadHash) {
+    if (existing.payloadFingerprint !== payloadFingerprint) {
       return { kind: 'idempotency-conflict' }
     }
     return { kind: 'replayed', order: existing.order }
   }
 
-  const sessionKey = `user:${userId}`
   const quote = getMockCheckoutQuote(userId)
-  if (
-    input.quoteVersion !== quote.quoteVersion ||
-    quote.hasStaleItems ||
-    quote.items.length === 0
-  ) {
-    return { kind: 'stale' }
+  if (quote.items.length === 0) return { kind: 'stale' }
+  const soldOutItem = quote.items.find(
+    (item) => item.availableEditions < item.quantity || item.availableEditions <= 0,
+  )
+  if (soldOutItem) {
+    return {
+      kind: 'unavailable',
+      message: `A edição de ${soldOutItem.title} não está mais disponível na quantidade escolhida. Revise o carrinho.`,
+    }
   }
-  if (
-    quote.items.some(
-      (item) => item.availableEditions < item.quantity || item.availableEditions <= 0,
-    )
-  ) {
-    return { kind: 'invalid-cart', message: 'Uma ou mais edições não estão mais disponíveis.' }
+  if (input.quoteVersion !== quote.quoteVersion || quote.hasStaleItems) {
+    return { kind: 'stale' }
   }
 
   const profile = getMockProfile(userId)
@@ -1412,15 +1546,9 @@ export function createMockOrder(
           : nft
       }),
     )
-    const cart = getStoredCart(sessionKey)
-    cart.items = cart.items.filter(
-      (cartItem) => !quote.items.some((item) => item.nftId === cartItem.nftId),
-    )
-    cart.couponCode = null
-    saveMockCart(sessionKey, cart)
   }
 
-  saveMockOrders([...getMockOrderTable(), { order, payloadHash }])
+  saveMockOrders([...getMockOrderTable(), { order, payloadFingerprint }])
   return { kind: 'created', order: structuredClone(order) }
 }
 
@@ -1451,31 +1579,17 @@ export function transitionMockOrder(
         : nft
     })
     saveMockNfts(restoredNfts)
+  } else {
     const sessionKey = `user:${userId}`
     const cart = getStoredCart(sessionKey)
-    for (const purchased of entry.order.snapshot.items) {
-      const nft = restoredNfts.find((item) => item.id === purchased.nftId)
-      if (!nft) continue
-      const existingItem = cart.items.find(
-        (item) => item.nftId === purchased.nftId,
+    cart.items = cart.items.flatMap((item) => {
+      const purchased = entry.order.snapshot.items.find(
+        (snapshotItem) => snapshotItem.nftId === item.nftId,
       )
-      if (existingItem) {
-        existingItem.quantity = Math.min(
-          nft.availableEditions,
-          existingItem.quantity + purchased.quantity,
-        )
-      } else {
-        cart.items.push({
-          itemId: `cart-${purchased.nftId}`,
-          nftId: purchased.nftId,
-          quantity: Math.min(purchased.quantity, nft.availableEditions),
-          editionType: purchased.editionType,
-          addedPriceEth: purchased.unitPriceEth,
-          addedVersion: nft.version,
-        })
-      }
-    }
-    cart.couponCode = entry.order.snapshot.couponCode
+      const quantity = item.quantity - (purchased?.quantity ?? 0)
+      return quantity > 0 ? [{ ...item, quantity }] : []
+    })
+    if (cart.items.length === 0) cart.couponCode = null
     saveMockCart(sessionKey, cart)
   }
   entry.order = {
@@ -1502,6 +1616,7 @@ export function addMockCartItem(
   }
   const nft = getMockNfts().find((item) => item.id === nftId)
   if (!nft) throw new RangeError('NFT não encontrado.')
+  if (editionType && editionType !== nft.editionType) throw new RangeError('EDITION_UNAVAILABLE')
 
   const cart = getStoredCart(sessionKey)
   const existingItem = cart.items.find((item) => item.nftId === nftId)
@@ -1511,9 +1626,8 @@ export function addMockCartItem(
   }
 
   if (existingItem) {
+    // O preço já visto não é atualizado aqui: só `acknowledgeMockCartChanges` confirma mudanças.
     existingItem.quantity = requestedTotal
-    existingItem.addedPriceEth = nft.priceEth
-    existingItem.addedVersion = nft.version
     if (editionType) existingItem.editionType = editionType
   } else {
     cart.items.push({
@@ -1548,8 +1662,6 @@ export function updateMockCartItem(
     if (!nft) throw new RangeError('NFT não encontrado.')
     if (quantity > nft.availableEditions) throw new RangeError('INSUFFICIENT_STOCK')
     storedItem.quantity = quantity
-    storedItem.addedPriceEth = nft.priceEth
-    storedItem.addedVersion = nft.version
   }
   saveMockCart(sessionKey, cart)
   return getMockCart(sessionKey)
@@ -1629,8 +1741,6 @@ export function resetMockDb(): NftItem[] {
   saveMockNfts(restoredItems)
   resetMockFavorites()
   resetMockAuth()
-  inMemoryCarts = {}
-  inMemoryOrders = []
   getStorage()?.removeItem(CART_STORAGE_KEY)
   getStorage()?.removeItem(ORDERS_STORAGE_KEY)
   return restoredItems

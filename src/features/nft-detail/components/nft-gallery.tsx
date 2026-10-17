@@ -14,18 +14,30 @@ export function NftGallery({
 }: NftGalleryProps) {
   const images = [...new Set([imageUrl, ...galleryUrls])]
   const [selectedImage, setSelectedImage] = useState(imageUrl)
+  const hasThumbnails = images.length > 1
 
+  // Mobile: miniaturas abaixo da imagem. Desktop (Figma): coluna vertical à esquerda.
   return (
-    <section aria-label={`Galeria de ${title}`} className="min-w-0">
-      <div className="overflow-hidden rounded-2xl border border-kurio-border bg-kurio-surface">
+    <section
+      aria-label={`Galeria de ${title}`}
+      className={`min-w-0 ${
+        hasThumbnails
+          ? 'lg:grid lg:grid-cols-[5.5rem_minmax(0,1fr)] lg:items-start lg:gap-4'
+          : ''
+      }`}
+    >
+      <div className="overflow-hidden rounded-2xl border border-kurio-border bg-kurio-surface lg:col-start-2 lg:row-start-1">
         <img
           src={selectedImage}
           alt={title}
+          width={640}
+          height={640}
+          fetchPriority="high"
           className="aspect-square w-full object-cover"
         />
       </div>
-      {images.length > 1 ? (
-        <div className="mt-3 grid grid-cols-4 gap-2 sm:gap-3">
+      {hasThumbnails ? (
+        <div className="mt-3 grid grid-cols-4 gap-2 sm:gap-3 lg:col-start-1 lg:row-start-1 lg:mt-0 lg:grid-cols-1 lg:content-start">
           {images.map((image, index) => (
             <button
               key={image}
@@ -42,6 +54,9 @@ export function NftGallery({
               <img
                 src={image}
                 alt=""
+                width={88}
+                height={88}
+                loading="lazy"
                 className="aspect-square w-full object-cover"
               />
             </button>

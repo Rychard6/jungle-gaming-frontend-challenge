@@ -1,4 +1,6 @@
-export type BlockchainNetwork = 'Ethereum' | 'Polygon' | 'Solana'
+export const BLOCKCHAIN_NETWORKS = ['Ethereum', 'Polygon', 'Solana'] as const
+
+export type BlockchainNetwork = (typeof BLOCKCHAIN_NETWORKS)[number]
 
 export type NftCollectionCategory =
   | 'Arte digital'
@@ -11,7 +13,9 @@ export type NftCollectionCategory =
   | 'Assinaturas'
   | 'Utilidade'
 
-export type NftEditionType = '1/1' | '1/10' | '1/50' | 'ABERTA'
+export const NFT_EDITION_TYPES = ['1/1', '1/10', '1/50', 'ABERTA'] as const
+
+export type NftEditionType = (typeof NFT_EDITION_TYPES)[number]
 
 export type CatalogTab = 'all' | 'new' | 'trending'
 
@@ -21,7 +25,13 @@ export type CatalogSort =
   | 'price_desc'
   | 'rating_desc'
 
-export type WalletProviderType = 'MetaMask' | 'WalletConnect' | 'Coinbase Wallet'
+export const WALLET_PROVIDER_TYPES = [
+  'MetaMask',
+  'WalletConnect',
+  'Coinbase Wallet',
+] as const
+
+export type WalletProviderType = (typeof WALLET_PROVIDER_TYPES)[number]
 
 export interface NftItem {
   id: string
@@ -60,6 +70,7 @@ export interface CatalogQueryParams {
   maxPriceEth?: string
   tab?: CatalogTab
   sort?: CatalogSort
+  featured?: boolean
   page?: number
   limit?: number
 }
@@ -257,17 +268,26 @@ export interface AuthSessionResponseDto {
   wallets: WalletDto[]
 }
 
-export type MockScenarioId =
-  | 'default'
-  | 'slow-network'
-  | 'out-of-order'
-  | 'network-error'
-  | 'server-error-500'
-  | 'session-expired'
-  | 'price-change-on-checkout'
-  | 'edition-sold-out'
-  | 'order-timeout-recovery'
-  | 'payment-declined'
+export const MOCK_SCENARIO_IDS = [
+  'default',
+  'empty-results',
+  'slow-network',
+  'out-of-order',
+  'network-error',
+  'server-error-500',
+  'session-expired',
+  'price-change-on-checkout',
+  'edition-sold-out',
+  'order-timeout-recovery',
+  'order-pending',
+  'payment-declined',
+] as const
+
+export type MockScenarioId = (typeof MOCK_SCENARIO_IDS)[number]
+
+export function isMockScenarioId(value: unknown): value is MockScenarioId {
+  return MOCK_SCENARIO_IDS.some((scenario) => scenario === value)
+}
 
 export interface SocketEventEnvelope<
   TType extends string,

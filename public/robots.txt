@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+# Telas exportadas do Figma, usadas apenas como referência de design.
+Disallow: /prototipo/

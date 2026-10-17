@@ -1,5 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useNavigate } from '@tanstack/react-router'
+import { useSessionKey } from '../../../shared/api/use-session-key'
 import { getSessionCacheKey } from '../../../shared/api/http'
+import { useAuth } from '../../auth/hooks/auth-context'
 import {
   addFavorite,
   fetchFavorites,
@@ -9,20 +12,26 @@ import {
 interface FavoriteChange {
   nftId: string
   favorite: boolean
+  sessionKey: string
 }
 
 interface FavoriteMutationContext {
-  previousFavorites: string[] | undefined
+  previouslyFavorite: boolean
 }
 
 export function useFavorites(nftId: string) {
   const queryClient = useQueryClient()
-  const sessionId = getSessionCacheKey() ?? 'anonymous'
-  const queryKey = ['favorites', sessionId] as const
+  const navigate = useNavigate()
+  const auth = useAuth()
+  const isAuthenticated = Boolean(auth.session)
+  const sessionKey = useSessionKey()
+  const queryKey = ['favorites', sessionKey] as const
 
+  // Favoritos pertencem ao usuário autenticado: visitantes nem chegam a consultar a API.
   const favoritesQuery = useQuery({
     queryKey,
     queryFn: ({ signal }) => fetchFavorites(signal),
+    enabled: isAuthenticated,
   })
 
   const mutation = useMutation<
@@ -31,41 +40,63 @@ export function useFavorites(nftId: string) {
     FavoriteChange,
     FavoriteMutationContext
   >({
-    mutationFn: ({ nftId: changedNftId, favorite }) =>
-      favorite ? addFavorite(changedNftId) : removeFavorite(changedNftId),
-    onMutate: async ({ nftId: changedNftId, favorite }) => {
-      await queryClient.cancelQueries({ queryKey })
-      const previousFavorites = queryClient.getQueryData<string[]>(queryKey)
+    mutationKey: ['favorites', sessionKey],
+    mutationFn: ({ nftId: changedNftId, favorite, sessionKey: originSession }) => {
+      if (getSessionCacheKey() !== originSession) throw new Error('A sessão mudou. Tente novamente.')
+      return favorite ? addFavorite(changedNftId) : removeFavorite(changedNftId)
+    },
+    onMutate: async ({ nftId: changedNftId, favorite, sessionKey: originSession }) => {
+      const originKey = ['favorites', originSession] as const
+      await queryClient.cancelQueries({ queryKey: originKey })
+      if (getSessionCacheKey() !== originSession) throw new Error('A sessão mudou. Tente novamente.')
+      const previousFavorites = queryClient.getQueryData<string[]>(originKey)
       const currentFavorites = previousFavorites ?? []
       const updatedFavorites = favorite
         ? [...new Set([...currentFavorites, changedNftId])]
         : currentFavorites.filter((id) => id !== changedNftId)
 
-      queryClient.setQueryData(queryKey, updatedFavorites)
-      return { previousFavorites }
+      queryClient.setQueryData(originKey, updatedFavorites)
+      return { previouslyFavorite: currentFavorites.includes(changedNftId) }
     },
-    onError: (_error, _change, context) => {
-      if (!context) return
-      if (context.previousFavorites === undefined) {
-        queryClient.removeQueries({ queryKey, exact: true })
-      } else {
-        queryClient.setQueryData(queryKey, context.previousFavorites)
+    onError: (_error, change, context) => {
+      if (!context || getSessionCacheKey() !== change.sessionKey) return
+      queryClient.setQueryData<string[]>(['favorites', change.sessionKey], (current = []) =>
+        context.previouslyFavorite
+          ? [...new Set([...current, change.nftId])]
+          : current.filter((id) => id !== change.nftId),
+      )
+    },
+    onSettled: (_data, _error, change) => {
+      if (getSessionCacheKey() !== change.sessionKey) return
+      if (queryClient.isMutating({ mutationKey: ['favorites', change.sessionKey] }) === 1) {
+        void queryClient.invalidateQueries({ queryKey: ['favorites', change.sessionKey] })
       }
-    },
-    onSettled: () => {
-      void queryClient.invalidateQueries({ queryKey })
     },
   })
 
   const favorite = favoritesQuery.data?.includes(nftId) ?? false
 
+  const toggleFavorite = () => {
+    if (!isAuthenticated) {
+      auth.showNotice('Entre na sua conta para salvar NFTs nos favoritos.')
+      void navigate({
+        to: '/login',
+        search: {
+          redirect: `${window.location.pathname}${window.location.search}`,
+        },
+      })
+      return
+    }
+    mutation.mutate({ nftId, favorite: !favorite, sessionKey })
+  }
+
   return {
     favorite,
+    isAuthenticated,
     isLoading: favoritesQuery.isLoading,
     isPending: mutation.isPending,
     mutationError: mutation.error,
     loadError: favoritesQuery.error,
-    toggleFavorite: () =>
-      mutation.mutate({ nftId, favorite: !favorite }),
+    toggleFavorite,
   }
 }

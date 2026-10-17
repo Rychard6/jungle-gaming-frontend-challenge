@@ -24,7 +24,7 @@ function RouteLoadingFallback() {
   return (
     <main
       aria-busy="true"
-      className="mx-auto min-h-[55vh] max-w-7xl px-4 py-10 sm:px-8"
+      className="mx-auto min-h-screen max-w-7xl px-4 py-10 sm:px-8"
     >
       <div className="skeleton-shimmer h-8 w-56 rounded" />
       <div className="skeleton-shimmer mt-6 h-72 rounded-xl" />

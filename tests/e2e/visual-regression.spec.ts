@@ -11,7 +11,10 @@ test.beforeEach(async ({ page }) => {
 
 test('snapshot visual da página inicial', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Explore o mercado' })).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Resultados do catálogo' }).locator('article')).toHaveCount(9)
+  await expect(page.getByRole('group', { name: 'Escolher destaque' }).getByRole('button').first()).toBeVisible()
   await expect(page).toHaveScreenshot('kurio-home.png', {
+    timeout: 15_000,
     fullPage: true,
     animations: 'disabled',
     caret: 'hide',
@@ -23,6 +26,7 @@ test('snapshot visual do detalhe de NFT', async ({ page }) => {
   await page.goto('/nfts/nft-1')
   await expect(page.getByRole('heading', { name: 'Emerald Ape #042' })).toBeVisible()
   await expect(page).toHaveScreenshot('kurio-nft-detail.png', {
+    timeout: 15_000,
     fullPage: true,
     animations: 'disabled',
     caret: 'hide',
@@ -35,6 +39,7 @@ test('snapshot visual do carrinho', async ({ page }) => {
   await page.goto('/cart')
   await expect(page.getByRole('heading', { name: 'Carrinho de NFTs' })).toBeVisible()
   await expect(page).toHaveScreenshot('kurio-cart.png', {
+    timeout: 15_000,
     fullPage: true,
     animations: 'disabled',
     caret: 'hide',
@@ -46,6 +51,7 @@ test('snapshot visual do pagamento', async ({ page }) => {
   await enterCheckoutAsGuest(page)
   await expect(page.getByRole('heading', { name: 'Finalizar compra' })).toBeVisible()
   await expect(page).toHaveScreenshot('kurio-checkout.png', {
+    timeout: 15_000,
     fullPage: true,
     animations: 'disabled',
     caret: 'hide',

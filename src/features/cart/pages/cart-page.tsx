@@ -1,9 +1,13 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { Link, useNavigate } from '@tanstack/react-router'
 import { ArrowLeft, Minus, Plus, Trash2 } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import type { CartDto, CartItemDto } from '../../../shared/api/types'
 import { formatEthDisplay } from '../../../shared/lib/eth-math'
+import { useDocumentTitle } from '../../../shared/lib/use-document-title'
+import { Button } from '../../../shared/ui/button'
+import { buttonVariants } from '../../../shared/ui/button-variants'
+import { Skeleton } from '../../../shared/ui/skeleton'
 import { fetchCatalog } from '../../catalog/api/catalog-api'
 import { NftCard } from '../../catalog/components/nft-card'
 import { CartSummaryCard } from '../components/cart-summary-card'
@@ -12,42 +16,41 @@ import { useAuth } from '../../auth/hooks/auth-context'
 
 function CartSkeleton() {
   return (
-    <div className="grid gap-7 lg:grid-cols-[minmax(0,1fr)_350px]">
+    <div aria-busy="true" className="grid gap-7 lg:grid-cols-[minmax(0,1fr)_350px]">
+      <span className="sr-only">Carregando carrinho…</span>
       <div className="space-y-3">
         {Array.from({ length: 2 }, (_, index) => (
           <div
             key={index}
             className="flex gap-4 rounded-xl border border-kurio-border bg-kurio-surface p-4"
           >
-            <div className="skeleton-shimmer aspect-square w-24 shrink-0 rounded-lg sm:w-32" />
+            <Skeleton className="aspect-square w-24 shrink-0 rounded-lg sm:w-32" />
             <div className="flex min-w-0 flex-1 flex-col gap-3 py-1">
-              <div className="skeleton-shimmer h-4 w-2/3 rounded" />
-              <div className="skeleton-shimmer h-3 w-1/3 rounded" />
-              <div className="skeleton-shimmer mt-auto h-4 w-1/2 rounded" />
+              <Skeleton className="h-4 w-2/3" />
+              <Skeleton className="h-3 w-1/3" />
+              <Skeleton className="mt-auto h-4 w-1/2" />
             </div>
           </div>
         ))}
       </div>
-      <div className="skeleton-shimmer h-[360px] rounded-xl border border-kurio-border" />
+      <Skeleton className="h-[360px] rounded-xl border border-kurio-border" />
     </div>
   )
 }
 
-function getCartErrorMessage(error: unknown): string {
-  if (!(error instanceof Error)) return 'Não foi possível atualizar o carrinho.'
-  if ('code' in error && error.code === 'INSUFFICIENT_STOCK') {
+function getCartErrorMessage(error: Error): string {
+  const code = 'code' in error ? error.code : undefined
+  if (code === 'INSUFFICIENT_STOCK') {
     return 'A quantidade solicitada excede as edições disponíveis.'
   }
-  if ('code' in error && error.code === 'COUPON_EXPIRED') {
-    return 'Este código promocional expirou.'
-  }
-  if ('code' in error && error.code === 'INVALID_COUPON') {
-    return 'Código promocional inválido.'
-  }
-  if ('code' in error && error.code === 'COUPON_MINIMUM_NOT_MET') {
-    return 'O subtotal mínimo para este cupom é 2.00 ETH.'
-  }
+  if (code === 'COUPON_EXPIRED') return 'Este código promocional expirou.'
+  if (code === 'INVALID_COUPON') return 'Código promocional inválido.'
+  // As demais mensagens (inclusive a do subtotal mínimo do cupom) vêm da API: a regra mora lá.
   return error.message
+}
+
+function formatEditions(count: number): string {
+  return `${count} ${count === 1 ? 'edição' : 'edições'}`
 }
 
 function CartItemRow({
@@ -59,7 +62,7 @@ function CartItemRow({
   item: CartItemDto
   busy: boolean
   onUpdate: (itemId: string, quantity: number) => void
-  onRemove: (itemId: string) => void
+  onRemove: (item: CartItemDto) => void
 }) {
   const unavailable = item.availableEditions === 0
 
@@ -74,6 +77,8 @@ function CartItemRow({
         <img
           src={item.imageUrl}
           alt={item.title}
+          width={128}
+          height={128}
           className="aspect-square w-full object-cover"
         />
       </Link>
@@ -83,7 +88,7 @@ function CartItemRow({
             <Link
               to="/nfts/$nftId"
               params={{ nftId: item.nftId }}
-              className="line-clamp-2 text-xs font-bold text-kurio-text hover:text-kurio-amber sm:text-sm"
+              className="line-clamp-2 text-xs font-bold text-kurio-text hover:text-kurio-amber focus-visible:outline-2 focus-visible:outline-kurio-amber sm:text-sm"
             >
               {item.title}
             </Link>
@@ -96,7 +101,7 @@ function CartItemRow({
           </div>
           <button
             type="button"
-            onClick={() => onRemove(item.itemId)}
+            onClick={() => onRemove(item)}
             disabled={busy}
             aria-label={`Remover ${item.title} do carrinho`}
             className="grid size-8 shrink-0 place-items-center rounded-full text-kurio-text-muted hover:bg-kurio-danger/10 hover:text-kurio-danger focus-visible:outline-2 focus-visible:outline-kurio-amber disabled:opacity-50 sm:hidden"
@@ -109,6 +114,7 @@ function CartItemRow({
         </p>
         <div className="mt-auto flex flex-wrap items-end justify-between gap-3 pt-4">
           <div
+            role="group"
             className="inline-flex items-center gap-2 rounded-full border border-kurio-border p-1"
             aria-label={`Quantidade de ${item.title}`}
           >
@@ -138,18 +144,23 @@ function CartItemRow({
             {formatEthDisplay(item.lineTotalEth)}
           </p>
         </div>
+        {item.quantity >= item.availableEditions && !item.insufficientStock && (
+          <p className="mt-2 text-[9px] text-kurio-text-muted">
+            Limite de {formatEditions(item.availableEditions)} disponíveis atingido.
+          </p>
+        )}
         {item.insufficientStock && (
           <p role="alert" className="mt-2 text-[9px] text-kurio-danger">
             {unavailable
               ? 'Esta peça esgotou.'
-              : `Disponibilidade reduzida para ${item.availableEditions} edição(ões).`}
+              : `Disponibilidade reduzida para ${formatEditions(item.availableEditions)}.`}
           </p>
         )}
       </div>
       <div className="hidden flex-col items-end justify-between sm:flex">
         <button
           type="button"
-          onClick={() => onRemove(item.itemId)}
+          onClick={() => onRemove(item)}
           disabled={busy}
           aria-label={`Remover ${item.title} do carrinho`}
           className="grid size-9 place-items-center rounded-full text-kurio-text-muted hover:bg-kurio-danger/10 hover:text-kurio-danger focus-visible:outline-2 focus-visible:outline-kurio-amber disabled:opacity-50"
@@ -215,14 +226,13 @@ function CartChangeBanner({
           </li>
         ))}
       </ul>
-      <button
-        type="button"
+      <Button
         onClick={onAcknowledge}
         disabled={busy}
-        className="mt-4 rounded-md bg-kurio-amber px-4 py-2.5 text-[10px] font-bold text-kurio-bg hover:bg-kurio-amber-hover focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-kurio-text disabled:opacity-50"
+        className="mt-4 font-bold"
       >
         Confirmar novos valores
-      </button>
+      </Button>
     </section>
   )
 }
@@ -232,15 +242,25 @@ export function CartPage() {
   const navigate = useNavigate()
   const auth = useAuth()
   const [notice, setNotice] = useState('')
+  const [announcement, setAnnouncement] = useState('')
+  const headingRef = useRef<HTMLHeadingElement>(null)
+  useDocumentTitle('Carrinho de NFTs — KURIO')
   const recommendationsQuery = useQuery({
     queryKey: ['nfts', 'cart-recommendations'],
     queryFn: ({ signal }) =>
       fetchCatalog({ page: 1, sort: 'recent', tab: 'all' }, signal),
   })
   const cart = cartState.cart
-  const errorMessage = cartState.mutationError
-    ? getCartErrorMessage(cartState.mutationError)
-    : cartState.loadError?.message ?? ''
+  const mutationError = cartState.mutationError
+  const isCouponAction =
+    cartState.mutationAction === 'apply-coupon' ||
+    cartState.mutationAction === 'delete-coupon'
+  // Cada erro aparece uma única vez, junto ao controle que o causou.
+  const couponError =
+    mutationError && isCouponAction ? getCartErrorMessage(mutationError) : ''
+  const itemsError =
+    mutationError && !isCouponAction ? getCartErrorMessage(mutationError) : ''
+  const loadErrorMessage = cartState.loadError?.message ?? ''
   const hasUnavailableItems =
     cart?.items.some((item) => item.insufficientStock) ?? false
 
@@ -259,20 +279,31 @@ export function CartPage() {
           Não foi possível carregar o carrinho.
         </h1>
         <p role="alert" className="mt-3 text-sm text-kurio-danger">
-          {errorMessage}
+          {loadErrorMessage || 'Tente novamente em instantes.'}
         </p>
-        <button
-          type="button"
+        <Button
+          size="lg"
           onClick={() => void cartState.refetch()}
-          className="mt-6 rounded-md bg-kurio-amber px-4 py-3 text-xs font-bold text-kurio-bg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-kurio-amber"
+          className="mt-6"
         >
           Tentar novamente
-        </button>
+        </Button>
       </main>
     )
   }
 
-  const mutationError = cartState.mutationError
+  const itemsInCart = new Set(cart.items.map((item) => item.nftId))
+  const recommendations =
+    recommendationsQuery.data?.items
+      .filter((nft) => !itemsInCart.has(nft.id))
+      .slice(0, 5) ?? []
+
+  // Move o foco antes de o botão sumir do DOM; sem isso o foco do teclado seria perdido.
+  const removeItem = (item: CartItemDto) => {
+    headingRef.current?.focus()
+    setAnnouncement(`${item.title} removido do carrinho.`)
+    cartState.removeItem(item.itemId)
+  }
 
   return (
     <main className="mx-auto max-w-7xl px-4 py-7 sm:px-8 sm:py-12">
@@ -280,39 +311,39 @@ export function CartPage() {
         <Link to="/" search={{ tab: 'all', sort: 'recent', page: 1 }} className="hover:text-kurio-amber">
           Início
         </Link>
-        <span className="mx-2">/</span>
-        <Link to="/" search={{ tab: 'all', sort: 'recent', page: 1 }} className="hover:text-kurio-amber">
+        <span className="mx-2" aria-hidden="true">/</span>
+        <Link to="/" search={{ tab: 'all', sort: 'recent', page: 1 }} hash="catalogo" className="hover:text-kurio-amber">
           Mercado
         </Link>
-        <span className="mx-2">/</span>
+        <span className="mx-2" aria-hidden="true">/</span>
         <span aria-current="page" className="text-kurio-text">Carrinho</span>
       </nav>
       <div className="mb-6 flex items-center gap-3 sm:mb-8">
-        <button
-          type="button"
-          onClick={() =>
-            void navigate({
-              to: '/',
-              search: { tab: 'all', sort: 'recent', page: 1 },
-            })
-          }
+        <Link
+          to="/"
+          search={{ tab: 'all', sort: 'recent', page: 1 }}
           aria-label="Voltar ao catálogo"
           className="grid size-10 place-items-center rounded-full border border-kurio-border text-kurio-text hover:border-kurio-amber focus-visible:outline-2 focus-visible:outline-kurio-amber sm:hidden"
         >
           <ArrowLeft size={17} aria-hidden="true" />
-        </button>
+        </Link>
         <div>
           <p className="hidden text-[10px] uppercase tracking-[0.2em] text-kurio-amber sm:block">
             Sua seleção
           </p>
-          <h1 className="text-xl font-bold text-kurio-text sm:mt-2 sm:text-2xl">
+          <h1
+            ref={headingRef}
+            tabIndex={-1}
+            className="text-xl font-bold text-kurio-text focus:outline-none sm:mt-2 sm:text-2xl"
+          >
             Carrinho de NFTs
           </h1>
         </div>
         <span className="ml-auto text-[10px] text-kurio-text-muted">
-          {cart.items.reduce((sum, item) => sum + item.quantity, 0)} edições
+          {formatEditions(cart.items.reduce((sum, item) => sum + item.quantity, 0))}
         </span>
       </div>
+      <p aria-live="polite" className="sr-only">{announcement}</p>
 
       <CartChangeBanner
         cart={cart}
@@ -341,9 +372,9 @@ export function CartPage() {
 
       <div className="grid items-start gap-7 lg:grid-cols-[minmax(0,1fr)_350px]">
         <section aria-label="Itens no carrinho" className="min-w-0">
-          {mutationError && (
+          {itemsError && (
             <p role="alert" className="mb-4 rounded-lg border border-kurio-danger/40 bg-kurio-surface p-3 text-xs text-kurio-danger">
-              {errorMessage}
+              {itemsError}
             </p>
           )}
           {cart.items.length > 0 ? (
@@ -354,7 +385,7 @@ export function CartPage() {
                   item={item}
                   busy={cartState.isMutating}
                   onUpdate={cartState.updateItem}
-                  onRemove={cartState.removeItem}
+                  onRemove={removeItem}
                 />
               ))}
             </div>
@@ -369,7 +400,7 @@ export function CartPage() {
               <Link
                 to="/"
                 search={{ tab: 'all', sort: 'recent', page: 1 }}
-                className="mt-5 inline-flex rounded-md bg-kurio-amber px-4 py-3 text-xs font-bold text-kurio-bg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-kurio-amber"
+                className={buttonVariants({ size: 'lg', className: 'mt-5' })}
               >
                 Explorar catálogo
               </Link>
@@ -381,7 +412,7 @@ export function CartPage() {
           cart={cart}
           disabled={cart.hasStaleItems || hasUnavailableItems}
           busy={cartState.isMutating}
-          error={errorMessage}
+          couponError={couponError}
           onApplyCoupon={(code) => {
             setNotice('')
             cartState.applyCoupon(code)
@@ -416,7 +447,7 @@ export function CartPage() {
           </p>
         ) : (
           <div className="mt-5 grid grid-cols-2 gap-3 md:grid-cols-3 md:gap-5 xl:grid-cols-5">
-            {recommendationsQuery.data?.items.slice(0, 5).map((nft) => (
+            {recommendations.map((nft) => (
               <NftCard key={nft.id} nft={nft} />
             ))}
           </div>

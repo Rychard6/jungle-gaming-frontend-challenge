@@ -1,16 +1,20 @@
 import { useState } from 'react'
-import { useNavigate } from '@tanstack/react-router'
-import { Heart, ShoppingBag, Eye } from 'lucide-react'
+import { Link } from '@tanstack/react-router'
+import { Eye, Heart, ShoppingBag } from 'lucide-react'
 import type { NftItem } from '../../../shared/api/types'
 import { formatEthDisplay } from '../../../shared/lib/eth-math'
+import { Badge } from '../../../shared/ui/badge'
 import { useFavorites } from '../../favorites/hooks/use-favorites'
 import { useCart } from '../../cart/hooks/use-cart'
 
+const actionClass =
+  'relative z-10 grid size-10 place-items-center rounded-full shadow-lg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-kurio-amber'
+
 export function NftCard({ nft }: { nft: NftItem }) {
-  const navigate = useNavigate()
   const favorites = useFavorites(nft.id)
   const cart = useCart()
   const [message, setMessage] = useState('')
+  const soldOut = nft.availableEditions < 1
 
   const addToCart = async () => {
     try {
@@ -26,26 +30,31 @@ export function NftCard({ nft }: { nft: NftItem }) {
   }
 
   return (
-    <article className="group min-w-0 overflow-hidden rounded-xl border border-kurio-border bg-kurio-surface">
+    <article className="group relative min-w-0 overflow-hidden rounded-xl border border-kurio-border bg-kurio-surface">
       <div className="relative overflow-hidden">
         <img
           src={nft.imageUrl}
           alt={nft.description}
+          width={400}
+          height={400}
           loading="lazy"
-          className="aspect-square w-full object-cover transition-transform duration-500 group-hover:scale-[1.03]"
+          className="aspect-square w-full object-cover transition-transform duration-500 group-hover:scale-[1.03] motion-reduce:transition-none motion-reduce:group-hover:scale-100"
         />
-        {nft.isRare && (
-          <span className="absolute left-3 top-3 rounded-full bg-kurio-amber px-3 py-1 text-[10px] font-bold tracking-wider text-kurio-bg">
-            RARO
-          </span>
-        )}
-        <div className="absolute inset-x-3 bottom-3 flex translate-y-0 justify-center gap-2 opacity-100 transition-all group-hover:translate-y-0 group-hover:opacity-100 focus-within:translate-y-0 focus-within:opacity-100 sm:translate-y-2 sm:opacity-0">
+        <div className="absolute left-3 top-3 flex flex-wrap gap-1.5">
+          {nft.isRare && <Badge>RARO</Badge>}
+          {soldOut && <Badge variant="destructive" className="bg-kurio-bg/90">ESGOTADO</Badge>}
+        </div>
+        <div className="absolute inset-x-3 bottom-3 z-10 flex translate-y-0 justify-center gap-2 opacity-100 transition-all group-hover:translate-y-0 group-hover:opacity-100 focus-within:translate-y-0 focus-within:opacity-100 motion-reduce:transition-none sm:translate-y-2 sm:opacity-0">
           <button
             type="button"
             onClick={() => void addToCart()}
-            disabled={cart.isMutating || nft.availableEditions < 1}
-            aria-label={`Adicionar ${nft.title} ao carrinho`}
-            className="grid size-10 place-items-center rounded-full bg-kurio-amber text-kurio-bg shadow-lg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-kurio-amber disabled:opacity-50"
+            disabled={cart.isMutating || soldOut}
+            aria-label={
+              soldOut
+                ? `${nft.title} esgotado`
+                : `Adicionar ${nft.title} ao carrinho`
+            }
+            className={`${actionClass} bg-kurio-amber text-kurio-bg disabled:opacity-50`}
           >
             <ShoppingBag size={17} aria-hidden="true" />
           </button>
@@ -55,18 +64,18 @@ export function NftCard({ nft }: { nft: NftItem }) {
             disabled={favorites.isPending}
             aria-label={favorites.favorite ? `Remover ${nft.title} dos favoritos` : `Favoritar ${nft.title}`}
             aria-pressed={favorites.favorite}
-            className="grid size-10 place-items-center rounded-full bg-kurio-bg/90 text-kurio-text shadow-lg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-kurio-amber disabled:opacity-60"
+            className={`${actionClass} bg-kurio-bg/90 text-kurio-text disabled:opacity-60`}
           >
             <Heart size={17} fill={favorites.favorite ? 'currentColor' : 'none'} aria-hidden="true" />
           </button>
-          <button
-            type="button"
-            onClick={() => void navigate({ to: '/nfts/$nftId', params: { nftId: nft.id } })}
+          <Link
+            to="/nfts/$nftId"
+            params={{ nftId: nft.id }}
             aria-label={`Ver detalhes de ${nft.title}`}
-            className="grid size-10 place-items-center rounded-full bg-kurio-bg/90 text-kurio-text shadow-lg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-kurio-amber"
+            className={`${actionClass} bg-kurio-bg/90 text-kurio-text`}
           >
             <Eye size={17} aria-hidden="true" />
-          </button>
+          </Link>
         </div>
       </div>
       <div className="p-4">
@@ -75,15 +84,22 @@ export function NftCard({ nft }: { nft: NftItem }) {
             <p className="truncate text-[10px] uppercase tracking-[0.12em] text-kurio-text-muted">
               {nft.collectionName}
             </p>
-            <h3 className="mt-1 truncate text-sm font-semibold text-kurio-text">
-              {nft.title}
+            <h3 className="mt-1 min-h-10 break-words text-xs font-semibold text-kurio-text sm:text-sm">
+              {/* Link "esticado": toda a área do cartão abre o detalhe; os botões ficam acima (z-10). */}
+              <Link
+                to="/nfts/$nftId"
+                params={{ nftId: nft.id }}
+                className="after:absolute after:inset-0 after:content-[''] focus-visible:outline-2 focus-visible:outline-kurio-amber"
+              >
+                {nft.title}
+              </Link>
             </h3>
           </div>
           <span className="shrink-0 rounded border border-kurio-border px-2 py-1 text-[10px] text-kurio-text-muted">
             {nft.editionType}
           </span>
         </div>
-        <div className="mt-4 flex items-end justify-between gap-2">
+        <div className="mt-4 flex flex-wrap items-end justify-between gap-2">
           <div>
             <p className="text-[10px] uppercase text-kurio-text-muted">Preço</p>
             <p className="mt-1 font-bold text-kurio-amber">
@@ -109,9 +125,8 @@ export function NftCard({ nft }: { nft: NftItem }) {
           <p role="alert" className="mt-2 text-[10px] text-kurio-danger">
             Não foi possível carregar a lista de favoritos.
           </p>
-        ) : (
-          <p aria-live="polite" className="sr-only">{message}</p>
-        )}
+        ) : null}
+        <p aria-live="polite" className="sr-only">{message}</p>
       </div>
     </article>
   )

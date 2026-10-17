@@ -9,8 +9,12 @@ export interface CatalogSearchParams {
   maxPrice?: string
   tab?: 'all' | 'new' | 'trending'
   sort?: 'recent' | 'price_asc' | 'price_desc' | 'rating_desc'
+  featured?: boolean
   page?: number
+  limit?: number
 }
+
+export const CATALOG_PAGE_SIZE = 9
 
 function toApiArray(value?: string): string[] | undefined {
   const values = value?.split(',').map((item) => item.trim()).filter(Boolean)
@@ -30,12 +34,20 @@ export async function fetchCatalog(
       maxPriceEth: params.maxPrice,
       tab: params.tab,
       sort: params.sort,
+      featured: params.featured ? true : undefined,
       page: params.page ?? 1,
-      limit: 9,
+      limit: params.limit ?? CATALOG_PAGE_SIZE,
     },
     signal,
   })
   return response.data
+}
+
+// Mantém o prefixo ['nfts'] para que eventos `nft.updated` atualizem também os destaques.
+export const featuredNftsQueryKey = ['nfts', 'featured'] as const
+
+export function fetchFeaturedNfts(signal?: AbortSignal): Promise<CatalogResponse> {
+  return fetchCatalog({ featured: true, limit: 6 }, signal)
 }
 
 export const catalogCategories: NftCollectionCategory[] = [

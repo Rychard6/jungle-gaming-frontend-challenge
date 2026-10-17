@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
@@ -10,6 +13,10 @@
     "preview": "vite preview",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
+    "test:e2e:update-snapshots": "playwright test visual-regression --update-snapshots=all",
+    "lighthouse": "npx --yes @lhci/cli@0.14.0 autorun --config=./lighthouserc.cjs",
+    "lighthouse:desktop": "npx --yes @lhci/cli@0.14.0 autorun --config=./lighthouserc.desktop.cjs",
+    "lighthouse:summary": "node scripts/summarize-lighthouse.mjs",
     "typecheck": "tsc -b"
   },
   "dependencies": {
@@ -26,6 +33,7 @@
     "tailwindcss": "^4.3.3"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.14.0",
     "@eslint/js": "^10.0.1",
     "@mswjs/socket.io-binding": "^0.2.0",
     "@playwright/test": "^1.64.1",

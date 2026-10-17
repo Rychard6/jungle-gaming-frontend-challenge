@@ -13,10 +13,13 @@ export interface AuthContextValue {
   isLoading: boolean
   notice: string
   clearNotice: () => void
+  showNotice: (message: string) => void
   login: (input: LoginRequestDto) => Promise<AuthResponseDto>
   register: (input: RegisterRequestDto) => Promise<AuthResponseDto>
   logout: () => Promise<void>
   switchUser: (user: 'nova' | 'kael' | 'guest') => Promise<void>
+  /** Descarta identidade, caches privados e assinaturas locais sem chamar a API. */
+  resetLocalSession: () => void
 }
 
 export const AuthContext = createContext<AuthContextValue | null>(null)

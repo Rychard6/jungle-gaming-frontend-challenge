@@ -3,21 +3,59 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
 import { AlertTriangle, Check, ChevronDown, CreditCard, LoaderCircle, WalletCards } from 'lucide-react'
 import { ApiClientError, getSessionCacheKey } from '../../../shared/api/http'
-import type {
-  CollectorCheckoutData,
-  CreateOrderRequestDto,
-  WalletDto,
-  WalletProviderType,
+import { useSessionKey } from '../../../shared/api/use-session-key'
+import {
+  BLOCKCHAIN_NETWORKS,
+  WALLET_PROVIDER_TYPES,
+  type BlockchainNetwork,
+  type CheckoutQuoteDto,
+  type CollectorCheckoutData,
+  type CreateOrderRequestDto,
+  type WalletDto,
+  type WalletProviderType,
 } from '../../../shared/api/types'
 import { formatEthDisplay } from '../../../shared/lib/eth-math'
+import { useDocumentTitle } from '../../../shared/lib/use-document-title'
+import {
+  validateCollector,
+  type FieldErrors,
+} from '../../../shared/lib/validation'
+import { Button } from '../../../shared/ui/button'
+import { buttonVariants } from '../../../shared/ui/button-variants'
+import { Skeleton } from '../../../shared/ui/skeleton'
 import { useAuth } from '../../auth/hooks/auth-context'
 import { applyCartCoupon, acknowledgeCartChanges } from '../../cart/api/cart-api'
 import { fetchWallets } from '../../wallets/api/wallets-api'
 import { fetchCheckoutQuote, createOrder } from '../api/checkout-api'
+import {
+  clearIdempotencyRecord,
+  getIdempotencyStorageKey,
+  getPendingIdempotencyKey,
+  getPersistedIdempotencyKey,
+  signOrderInput,
+} from '../lib/idempotency'
 import { subscribeNftUpdates } from '../../../shared/socket/socket-client'
 import { fetchOrders } from '../../orders/api/orders-api'
 
 type WalletConnectionState = 'connected' | 'declined' | 'disconnected'
+
+// Falhas de compra que tornam a cotação em tela obsoleta e exigem uma nova confirmação do usuário.
+const REVIEW_REQUIRED_CODES = new Set([
+  'STALE_QUOTE',
+  'EDITION_SOLD_OUT',
+  'INSUFFICIENT_STOCK',
+  'CART_NOT_PURCHASABLE',
+])
+
+const COLLECTOR_FIELDS = [
+  'displayName',
+  'username',
+  'profileName',
+  'walletAddress',
+  'referralCode',
+  'email',
+  'ensName',
+] as const
 
 function displayWalletAddress(wallet: WalletDto | undefined): string {
   if (!wallet) return 'Nenhuma carteira selecionada'
@@ -28,56 +66,31 @@ function getField(formData: FormData, name: string): string {
   return String(formData.get(name) ?? '').trim()
 }
 
-async function hashOrderInput(input: CreateOrderRequestDto): Promise<string> {
-  const digest = await crypto.subtle.digest(
-    'SHA-256',
-    new TextEncoder().encode(JSON.stringify(input)),
-  )
-  return Array.from(new Uint8Array(digest), (byte) =>
-    byte.toString(16).padStart(2, '0'),
-  ).join('')
-}
-
-function getPersistedIdempotencyKey(
-  storageKey: string,
-  signature: string,
-): string {
-  const saved = localStorage.getItem(storageKey)
-  if (saved) {
-    const record: unknown = JSON.parse(saved)
-    if (
-      typeof record === 'object' &&
-      record !== null &&
-      'key' in record &&
-      'signature' in record &&
-      typeof record.key === 'string' &&
-      typeof record.signature === 'string' &&
-      record.signature === signature
-    ) {
-      return record.key
-    }
-  }
-  const key = crypto.randomUUID()
-  localStorage.setItem(storageKey, JSON.stringify({ key, signature }))
-  return key
-}
-
 function CheckoutSkeleton() {
   return (
-    <div aria-busy="true" className="mx-auto grid max-w-7xl gap-6 px-4 py-10 lg:grid-cols-[minmax(0,1fr)_25rem] lg:px-8">
-      <div className="skeleton-shimmer h-[620px] rounded-xl" />
-      <div className="skeleton-shimmer h-[520px] rounded-xl" />
-    </div>
+    <main aria-busy="true" className="mx-auto grid max-w-7xl gap-6 px-4 py-10 lg:grid-cols-[minmax(0,1fr)_25rem] lg:px-8">
+      <span className="sr-only">Carregando checkout…</span>
+      <Skeleton className="h-[620px] rounded-xl" />
+      <Skeleton className="h-[520px] rounded-xl" />
+    </main>
   )
 }
+
+const inputClass =
+  'mt-1.5 h-10 w-full rounded-lg border border-kurio-border bg-kurio-bg px-3 text-xs text-kurio-text focus-visible:outline-2 focus-visible:outline-kurio-amber aria-invalid:border-kurio-danger'
+const selectClass =
+  'mt-1.5 h-10 w-full rounded-lg border border-kurio-border bg-kurio-bg px-2 text-xs text-kurio-text focus-visible:outline-2 focus-visible:outline-kurio-amber'
+const labelClass = 'block text-[10px] font-semibold text-kurio-text'
 
 export function CheckoutPage() {
   const auth = useAuth()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const sessionKey = getSessionCacheKey() ?? 'anonymous'
+  const sessionKey = useSessionKey()
+  const idempotencyStorageKey = getIdempotencyStorageKey(sessionKey)
   const quoteKey = ['checkout', 'quote', sessionKey] as const
   const walletsKey = ['wallets', sessionKey] as const
+  useDocumentTitle('Pagamento — KURIO')
   const quoteQuery = useQuery({
     queryKey: quoteKey,
     queryFn: ({ signal }) => fetchCheckoutQuote(signal),
@@ -93,11 +106,13 @@ export function CheckoutPage() {
     queryKey: ['orders', sessionKey],
     queryFn: ({ signal }) => fetchOrders(signal),
     enabled: Boolean(auth.session),
+    staleTime: 0,
     retry: false,
   })
   const [selectedWalletId, setSelectedWalletId] = useState('')
-  const [walletProvider, setWalletProvider] =
-    useState<WalletProviderType>('WalletConnect')
+  // Rede e provedor partem da carteira escolhida, mas o colecionador pode alterá-los.
+  const [networkOverride, setNetworkOverride] = useState<BlockchainNetwork | null>(null)
+  const [providerOverride, setProviderOverride] = useState<WalletProviderType | null>(null)
   const [connectionState, setConnectionState] =
     useState<WalletConnectionState>('connected')
   const [useAnotherWallet, setUseAnotherWallet] = useState(false)
@@ -110,31 +125,49 @@ export function CheckoutPage() {
   const [isReviewing, setIsReviewing] = useState(false)
   const [orderError, setOrderError] = useState('')
   const [orderTimeout, setOrderTimeout] = useState(false)
-  const idempotencyRef = useRef<{ key: string; signature: string } | null>(null)
+  const [fieldErrors, setFieldErrors] = useState<FieldErrors>({})
+  const idempotencyRef = useRef<{ key: string; signature: string; input: CreateOrderRequestDto } | null>(null)
+  // Barra cliques repetidos antes de o `isPending` da mutação refletir na tela.
+  const submittingRef = useRef(false)
+  const quoteRef = useRef<CheckoutQuoteDto | undefined>(undefined)
   const emptyCartError =
     quoteQuery.error instanceof ApiClientError &&
     quoteQuery.error.code === 'EMPTY_CART'
 
+  // Carrinho consumido por uma tentativa anterior (timeout/recarga): recupera o MESMO pedido
+  // pela chave de idempotência persistida, ou o pedido ainda pendente; nunca cria outro.
   useEffect(() => {
-    const latestOrder = ordersQuery.data?.orders[0]
-    if (
-      emptyCartError &&
-      latestOrder &&
-      latestOrder.status !== 'declined'
-    ) {
-      void navigate({
-        to: '/orders/$orderId',
-        params: { orderId: latestOrder.id },
-      })
-    }
-  }, [emptyCartError, navigate, ordersQuery.data])
+    if (!ordersQuery.data || getSessionCacheKey() !== sessionKey) return
+    const { orders } = ordersQuery.data
+    const attemptedKey = getPendingIdempotencyKey(idempotencyStorageKey)
+    const recovered =
+      (attemptedKey
+        ? orders.find((order) => order.idempotencyKey === attemptedKey)
+        : undefined) ?? orders.find((order) => order.status === 'pending')
+    if (!recovered) return
+    clearIdempotencyRecord(idempotencyStorageKey)
+    void navigate({
+      to: '/orders/$orderId',
+      params: { orderId: recovered.id },
+      replace: true,
+    })
+  }, [idempotencyStorageKey, navigate, ordersQuery.data, sessionKey])
 
+  useEffect(() => {
+    quoteRef.current = quoteQuery.data
+  })
+
+  // Só uma mudança em NFT que está na cotação exige nova revisão.
   useEffect(
     () =>
       subscribeNftUpdates((event) => {
+        const affected = quoteRef.current?.items.find(
+          (item) => item.nftId === event.payload.nftId,
+        )
+        if (!affected) return
         setNeedsReview(true)
         setUpdateNotice(
-          `O preço ou a disponibilidade de ${event.payload.nftId} mudou. Revise os valores antes de continuar.`,
+          `O preço ou a disponibilidade de ${affected.title} mudou. Revise os valores antes de continuar.`,
         )
       }),
     [],
@@ -144,8 +177,13 @@ export function CheckoutPage() {
   const primaryWallet = wallets.find((wallet) => wallet.isPrimary)
   const selectedWallet =
     wallets.find((wallet) => wallet.id === selectedWalletId) ?? primaryWallet
+  const network: BlockchainNetwork =
+    networkOverride ?? selectedWallet?.network ?? 'Ethereum'
+  const walletProvider: WalletProviderType =
+    providerOverride ?? selectedWallet?.walletType ?? 'MetaMask'
   const quote = quoteQuery.data
   const effectiveReviewRequired = needsReview || Boolean(quote?.hasStaleItems)
+
   const orderMutation = useMutation({
     mutationFn: ({
       input,
@@ -155,10 +193,11 @@ export function CheckoutPage() {
       idempotencyKey: string
     }) => createOrder(input, idempotencyKey),
     onSuccess: async (order) => {
+      if (getSessionCacheKey() !== sessionKey) return
       setOrderError('')
       setOrderTimeout(false)
       idempotencyRef.current = null
-      localStorage.removeItem(`kurio_order_idempotency_${sessionKey}`)
+      clearIdempotencyRecord(idempotencyStorageKey)
       await queryClient.invalidateQueries({ queryKey: ['cart'] })
       await navigate({
         to: '/orders/$orderId',
@@ -166,6 +205,11 @@ export function CheckoutPage() {
       })
     },
     onError: (error: unknown) => {
+      if (getSessionCacheKey() !== sessionKey) return
+      if (error instanceof ApiClientError) {
+        setFieldErrors(error.fieldErrors ?? {})
+        if (error.code === 'ORDER_PENDING') void queryClient.invalidateQueries({ queryKey: ['orders', sessionKey] })
+      }
       setOrderError(
         error instanceof Error
           ? error.message
@@ -173,22 +217,32 @@ export function CheckoutPage() {
       )
       setOrderTimeout(
         error instanceof ApiClientError &&
-          (error.status === 504 || error.code === 'ORDER_TIMEOUT'),
+          (error.status === 504 || error.status === 0 || error.code === 'ORDER_TIMEOUT'),
       )
-      if (error instanceof ApiClientError && error.code === 'STALE_QUOTE') {
+      if (error instanceof ApiClientError && REVIEW_REQUIRED_CODES.has(error.code)) {
         setNeedsReview(true)
+        // A API é a fonte de verdade: rebusca cotação e carrinho para mostrar os novos valores.
+        void queryClient.invalidateQueries({ queryKey: quoteKey })
+        void queryClient.invalidateQueries({ queryKey: ['cart'] })
       }
     },
   })
 
-  if (quoteQuery.isLoading || walletsQuery.isLoading) return <CheckoutSkeleton />
-  if (
-    emptyCartError &&
-    ordersQuery.isLoading
-  ) {
+  if (quoteQuery.isLoading || walletsQuery.isLoading || ordersQuery.isLoading) return <CheckoutSkeleton />
+  if (walletsQuery.isError || ordersQuery.isError) {
+    const failedQuery = walletsQuery.isError ? walletsQuery : ordersQuery
+    return (
+      <main className="mx-auto max-w-3xl px-4 py-16 text-center">
+        <h1 className="text-2xl font-bold">Não foi possível verificar sua conta</h1>
+        <p role="alert" className="mt-3 text-sm text-kurio-danger">{failedQuery.error?.message}</p>
+        <Button onClick={() => void failedQuery.refetch()} className="mt-6">Tentar novamente</Button>
+      </main>
+    )
+  }
+  if (emptyCartError && ordersQuery.isLoading) {
     return (
       <main aria-busy="true" className="mx-auto max-w-3xl px-4 py-16 text-center">
-        <div className="skeleton-shimmer mx-auto h-32 max-w-lg rounded-xl" />
+        <Skeleton className="mx-auto h-32 max-w-lg rounded-xl" />
         <p className="mt-4 text-xs text-kurio-text-muted">
           Verificando pedidos recentes para recuperar sua compra…
         </p>
@@ -196,6 +250,24 @@ export function CheckoutPage() {
     )
   }
   if (quoteQuery.isError || !quote) {
+    // Carrinho vazio (ex.: itens removidos por falta de estoque) não é uma falha técnica.
+    if (emptyCartError) {
+      return (
+        <main className="mx-auto max-w-3xl px-4 py-16 text-center">
+          <h1 className="text-2xl font-bold">Seu carrinho está vazio</h1>
+          <p className="mt-3 text-sm text-kurio-text-muted">
+            Não há itens para pagar. Explore o catálogo e escolha uma nova peça.
+          </p>
+          <Link
+            to="/"
+            search={{ tab: 'all', sort: 'recent', page: 1 }}
+            className={buttonVariants({ size: 'lg', className: 'mt-6' })}
+          >
+            Explorar catálogo
+          </Link>
+        </main>
+      )
+    }
     return (
       <main className="mx-auto max-w-3xl px-4 py-16 text-center">
         <h1 className="text-2xl font-bold">Não foi possível abrir o checkout</h1>
@@ -206,7 +278,7 @@ export function CheckoutPage() {
         </p>
         <Link
           to="/cart"
-          className="mt-6 inline-flex rounded-lg border border-kurio-amber px-4 py-3 text-xs font-bold text-kurio-amber"
+          className="mt-6 inline-flex rounded-lg border border-kurio-amber px-4 py-3 text-xs font-bold text-kurio-amber focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-kurio-amber"
         >
           Voltar ao carrinho
         </Link>
@@ -219,12 +291,14 @@ export function CheckoutPage() {
     setIsReviewing(true)
     try {
       await acknowledgeCartChanges()
+      await queryClient.invalidateQueries({ queryKey: ['cart'] })
       await queryClient.invalidateQueries({ queryKey: quoteKey })
       const result = await queryClient.fetchQuery({
         queryKey: quoteKey,
         queryFn: () => fetchCheckoutQuote(),
       })
       setNeedsReview(result.hasStaleItems)
+      setOrderError('')
       setUpdateNotice('')
     } catch (error) {
       setActionError(
@@ -242,6 +316,7 @@ export function CheckoutPage() {
     setCouponError('')
     try {
       await applyCartCoupon({ code: couponDraft })
+      await queryClient.invalidateQueries({ queryKey: ['cart'] })
       await queryClient.invalidateQueries({ queryKey: quoteKey })
       await queryClient.fetchQuery({
         queryKey: quoteKey,
@@ -255,6 +330,7 @@ export function CheckoutPage() {
 
   const submitOrder = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
+    if (submittingRef.current) return
     setOrderError('')
     if (!selectedWallet) {
       setOrderError('Cadastre ou selecione uma carteira antes de continuar.')
@@ -268,53 +344,115 @@ export function CheckoutPage() {
       )
       return
     }
-    if (effectiveReviewRequired) {
+    if (effectiveReviewRequired && !orderTimeout) {
       setOrderError('Revise a cotação atual antes de confirmar a compra.')
       return
     }
 
     const data = new FormData(event.currentTarget)
+    const values = Object.fromEntries(
+      [...COLLECTOR_FIELDS, 'secondaryWalletOrEns', 'ensDomain', 'notes'].map(
+        (name) => [name, getField(data, name)],
+      ),
+    )
     const collector: CollectorCheckoutData = {
-      displayName: getField(data, 'displayName'),
-      username: getField(data, 'username'),
-      network: selectedWallet.network,
-      profileName: getField(data, 'profileName'),
-      walletAddress: getField(data, 'walletAddress'),
-      ...(getField(data, 'secondaryWalletOrEns')
-        ? { secondaryWalletOrEns: getField(data, 'secondaryWalletOrEns') }
+      displayName: values.displayName,
+      username: values.username,
+      network,
+      profileName: values.profileName,
+      walletAddress: values.walletAddress,
+      ...(values.secondaryWalletOrEns
+        ? { secondaryWalletOrEns: values.secondaryWalletOrEns }
         : {}),
       walletType: walletProvider,
-      ...(getField(data, 'referralCode')
-        ? { referralCode: getField(data, 'referralCode') }
-        : {}),
-      email: getField(data, 'email'),
-      ensName: getField(data, 'ensName'),
-      ensDomain: getField(data, 'ensDomain'),
+      ...(values.referralCode ? { referralCode: values.referralCode } : {}),
+      email: values.email,
+      ensName: values.ensName,
+      ensDomain: values.ensDomain,
       useAnotherWallet,
-      ...(getField(data, 'notes') ? { notes: getField(data, 'notes') } : {}),
+      ...(values.notes ? { notes: values.notes } : {}),
     }
-    const input: CreateOrderRequestDto = {
+    const errors = validateCollector(collector)
+    setFieldErrors(errors)
+    const firstInvalid = Object.keys(errors)[0]
+    if (firstInvalid && !orderTimeout) {
+      document.getElementById(`checkout-${firstInvalid}`)?.focus()
+      return
+    }
+    const input: CreateOrderRequestDto = orderTimeout && idempotencyRef.current
+      ? idempotencyRef.current.input
+      : {
       quoteVersion: quote.quoteVersion,
       walletProvider,
-      network: selectedWallet.network,
+      network,
       collector,
     }
-    const signature = await hashOrderInput(input)
-    const storageKey = `kurio_order_idempotency_${sessionKey}`
-    const key =
-      idempotencyRef.current?.signature === signature
-        ? idempotencyRef.current.key
-        : getPersistedIdempotencyKey(storageKey, signature)
-    idempotencyRef.current = { key, signature }
-    await orderMutation.mutateAsync({
-      input,
-      idempotencyKey: key,
-    }).catch(() => undefined)
+
+    submittingRef.current = true
+    try {
+      const signature = await signOrderInput(input)
+      if (getSessionCacheKey() !== sessionKey) return
+      const key =
+        idempotencyRef.current?.signature === signature
+          ? idempotencyRef.current.key
+          : getPersistedIdempotencyKey(idempotencyStorageKey, signature)
+      idempotencyRef.current = { key, signature, input }
+      await orderMutation
+        .mutateAsync({ input, idempotencyKey: key })
+        .catch(() => undefined)
+    } finally {
+      submittingRef.current = false
+    }
   }
 
-  const inputClass =
-    'mt-1.5 h-10 w-full rounded-lg border border-kurio-border bg-kurio-bg px-3 text-xs text-kurio-text focus-visible:outline-2 focus-visible:outline-kurio-amber'
-  const labelClass = 'block text-[10px] font-semibold text-kurio-text'
+  const selectWallet = (walletId: string) => {
+    setSelectedWalletId(walletId)
+    setNetworkOverride(null)
+    setProviderOverride(null)
+    setFieldErrors({})
+  }
+
+  const renderTextField = ({
+    name,
+    label,
+    defaultValue,
+    type = 'text',
+    required = true,
+    autoComplete,
+  }: {
+    name: (typeof COLLECTOR_FIELDS)[number] | 'secondaryWalletOrEns'
+    label: string
+    defaultValue: string | undefined
+    type?: string
+    required?: boolean
+    autoComplete?: string
+  }) => {
+    const error = fieldErrors[name]
+    return (
+      <div>
+        <label htmlFor={`checkout-${name}`} className={labelClass}>
+          {label}
+          {required ? ' *' : ''}
+        </label>
+        <input
+          id={`checkout-${name}`}
+          name={name}
+          type={type}
+          defaultValue={defaultValue}
+          autoComplete={autoComplete}
+          aria-required={required}
+          aria-invalid={error ? true : undefined}
+          aria-describedby={error ? `checkout-${name}-error` : undefined}
+          className={inputClass}
+        />
+        {error && (
+          <p id={`checkout-${name}-error`} className="mt-1 text-[10px] text-kurio-danger">
+            {error}
+          </p>
+        )}
+      </div>
+    )
+  }
 
   return (
     <main className="mx-auto max-w-7xl px-4 py-7 sm:px-8 sm:py-10">
@@ -325,7 +463,7 @@ export function CheckoutPage() {
           </p>
           <h1 className="mt-2 text-2xl font-bold sm:text-3xl">Finalizar compra</h1>
         </div>
-        <Link to="/cart" className="text-xs text-kurio-text-muted underline underline-offset-4">
+        <Link to="/cart" className="text-xs text-kurio-text-muted underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-kurio-amber">
           Voltar ao carrinho
         </Link>
       </div>
@@ -336,7 +474,7 @@ export function CheckoutPage() {
           className="mb-6 rounded-xl border border-kurio-amber/50 bg-kurio-amber/10 p-4"
         >
           <div className="flex items-start gap-3">
-            <AlertTriangle size={19} className="mt-0.5 shrink-0 text-kurio-amber" />
+            <AlertTriangle size={19} aria-hidden="true" className="mt-0.5 shrink-0 text-kurio-amber" />
             <div>
               <h2 className="text-sm font-bold text-kurio-amber">
                 Cotação desatualizada
@@ -345,14 +483,13 @@ export function CheckoutPage() {
                 {updateNotice ||
                   'O preço ou a disponibilidade de um ou mais NFTs mudou. Confirme os novos valores antes de pagar.'}
               </p>
-              <button
-                type="button"
+              <Button
                 onClick={() => void refreshQuote()}
                 disabled={isReviewing}
-                className="mt-3 rounded-lg bg-kurio-amber px-4 py-2.5 text-xs font-bold text-kurio-bg disabled:opacity-60"
+                className="mt-3 rounded-lg"
               >
                 {isReviewing ? 'Atualizando…' : 'Revisar e confirmar novos valores'}
-              </button>
+              </Button>
             </div>
           </div>
         </section>
@@ -362,57 +499,81 @@ export function CheckoutPage() {
         <form
           key={selectedWallet?.id ?? 'no-wallet'}
           onSubmit={(event) => void submitOrder(event)}
+          noValidate
           className="space-y-5"
         >
           <section className="rounded-xl border border-kurio-border bg-kurio-surface p-4 sm:p-6">
             <h2 className="text-base font-bold">Perfil do colecionador</h2>
             <div className="mt-5 grid gap-4 sm:grid-cols-2">
-              <label className={labelClass}>
-                Nome de exibição *
-                <input name="displayName" required defaultValue={auth.session?.user.displayName} className={inputClass} />
-              </label>
-              <label className={labelClass}>
-                Nome de usuário *
-                <input name="username" required defaultValue={auth.session?.user.username} className={inputClass} />
-              </label>
-              <label className={labelClass}>
-                Rede *
-                <input readOnly value={selectedWallet?.network ?? ''} className={`${inputClass} opacity-75`} />
-              </label>
-              <label className={labelClass}>
-                Nome do perfil *
-                <input name="profileName" required defaultValue={selectedWallet?.profileName} className={inputClass} />
-              </label>
-              <label className={labelClass}>
-                Endereço da carteira *
-                <input name="walletAddress" required defaultValue={selectedWallet?.address} className={inputClass} />
-              </label>
-              <label className={labelClass}>
-                ENS ou carteira secundária (opcional)
-                <input name="secondaryWalletOrEns" defaultValue={selectedWallet?.secondaryAddressOrEns} className={inputClass} />
-              </label>
-              <label className={labelClass}>
-                Tipo de carteira *
-                <input readOnly value={walletProvider} className={`${inputClass} opacity-75`} />
-              </label>
-              <label className={labelClass}>
-                Código de indicação *
-                <input name="referralCode" required defaultValue={selectedWallet?.referralCode} className={inputClass} />
-              </label>
-              <label className={labelClass}>
-                E-mail *
-                <input name="email" required type="email" defaultValue={auth.session?.user.email} className={inputClass} />
-              </label>
+              {renderTextField({ name: 'displayName', label: 'Nome de exibição', defaultValue: auth.session?.user.displayName })}
+              {renderTextField({ name: 'username', label: 'Nome de usuário', defaultValue: auth.session?.user.username, autoComplete: 'username' })}
+              <div>
+                <label htmlFor="checkout-network" className={labelClass}>Rede *</label>
+                <select
+                  id="checkout-network"
+                  name="network"
+                  value={network}
+                  onChange={(event) => {
+                    const chosen = BLOCKCHAIN_NETWORKS.find((item) => item === event.target.value)
+                    if (chosen) setNetworkOverride(chosen)
+                  }}
+                  className={selectClass}
+                >
+                  {BLOCKCHAIN_NETWORKS.map((item) => (
+                    <option key={item} value={item}>{item}</option>
+                  ))}
+                </select>
+              </div>
+              {renderTextField({ name: 'profileName', label: 'Nome do perfil', defaultValue: selectedWallet?.profileName })}
+              {renderTextField({ name: 'walletAddress', label: 'Endereço da carteira', defaultValue: selectedWallet?.address })}
+              {renderTextField({ name: 'secondaryWalletOrEns', label: 'ENS ou carteira secundária (opcional)', defaultValue: selectedWallet?.secondaryAddressOrEns, required: false })}
+              <div>
+                <label htmlFor="checkout-wallet-type" className={labelClass}>Tipo de carteira *</label>
+                <select
+                  id="checkout-wallet-type"
+                  name="walletType"
+                  value={walletProvider}
+                  onChange={(event) => {
+                    const chosen = WALLET_PROVIDER_TYPES.find((item) => item === event.target.value)
+                    if (chosen) setProviderOverride(chosen)
+                  }}
+                  className={selectClass}
+                >
+                  {WALLET_PROVIDER_TYPES.map((item) => (
+                    <option key={item} value={item}>{item}</option>
+                  ))}
+                </select>
+              </div>
+              {renderTextField({ name: 'referralCode', label: 'Código de indicação', defaultValue: selectedWallet?.referralCode })}
+              {renderTextField({ name: 'email', label: 'E-mail', type: 'email', defaultValue: auth.session?.user.email, autoComplete: 'email' })}
               <fieldset>
                 <legend className={labelClass}>Nome ENS *</legend>
                 <div className="mt-1.5 flex gap-2">
-                  <input name="ensName" required defaultValue={selectedWallet?.ensName ?? auth.session?.user.ensName} className={`${inputClass} mt-0 min-w-0 flex-1`} />
-                  <select name="ensDomain" defaultValue={selectedWallet?.ensDomain ?? auth.session?.user.ensDomain} className="h-10 rounded-lg border border-kurio-border bg-kurio-bg px-2 text-[10px]">
+                  <input
+                    id="checkout-ensName"
+                    name="ensName"
+                    aria-label="Nome ENS"
+                    defaultValue={selectedWallet?.ensName ?? auth.session?.user.ensName}
+                    aria-invalid={fieldErrors.ensName ? true : undefined}
+                    aria-describedby={fieldErrors.ensName ? 'checkout-ensName-error' : undefined}
+                    className={`${inputClass} mt-0 min-w-0 flex-1`}
+                  />
+                  <select
+                    name="ensDomain"
+                    aria-label="Domínio ENS"
+                    defaultValue={selectedWallet?.ensDomain ?? auth.session?.user.ensDomain}
+                    className="h-10 rounded-lg border border-kurio-border bg-kurio-bg px-2 text-[10px] focus-visible:outline-2 focus-visible:outline-kurio-amber"
+                  >
                     <option value=".eth">.eth</option>
                     <option value=".kurio">.kurio</option>
                     <option value=".xyz">.xyz</option>
                   </select>
                 </div>
+                {fieldErrors.ensName && (
+                  <p id="checkout-ensName-error" className="mt-1 text-[10px] text-kurio-danger">
+                    {fieldErrors.ensName}
+                  </p>
+                )}
               </fieldset>
               <fieldset className="sm:col-span-2">
                 <legend className={labelClass}>Usar outra carteira?</legend>
@@ -431,10 +592,17 @@ export function CheckoutPage() {
                   ))}
                 </div>
               </fieldset>
-              <label className={`${labelClass} sm:col-span-2`}>
-                Observação do colecionador (opcional)
-                <textarea name="notes" rows={3} className={`${inputClass} h-auto py-3`} />
-              </label>
+              <div className="sm:col-span-2">
+                <label htmlFor="checkout-notes" className={labelClass}>
+                  Observação do colecionador (opcional)
+                </label>
+                <textarea
+                  id="checkout-notes"
+                  name="notes"
+                  rows={3}
+                  className={`${inputClass} h-auto py-3`}
+                />
+              </div>
             </div>
           </section>
 
@@ -451,7 +619,7 @@ export function CheckoutPage() {
                   <span className="sr-only">Trocar carteira</span>
                   <select
                     value={selectedWallet?.id ?? ''}
-                    onChange={(event) => setSelectedWalletId(event.target.value)}
+                    onChange={(event) => selectWallet(event.target.value)}
                     className="h-9 max-w-36 rounded-lg border border-kurio-amber bg-kurio-bg px-2 text-[10px] text-kurio-amber focus-visible:outline-2 focus-visible:outline-kurio-amber"
                   >
                     {wallets.map((wallet) => (
@@ -463,8 +631,8 @@ export function CheckoutPage() {
                 </label>
               )}
             </div>
-            <div className="mt-5">
-              <h3 className="text-xs font-bold">Carteira e rede</h3>
+            <fieldset className="mt-5">
+              <legend className="text-xs font-bold">Carteira e rede</legend>
               <div className="mt-3 grid gap-2 sm:grid-cols-3">
                 {([
                   ['WalletConnect', 'WALLETCONNECT', 'WALLETCONNECT • METAMASK • COINBASE'],
@@ -484,17 +652,17 @@ export function CheckoutPage() {
                       name="paymentWalletProvider"
                       value={provider}
                       checked={walletProvider === provider}
-                      onChange={() => setWalletProvider(provider)}
+                      onChange={() => setProviderOverride(provider)}
                       className="accent-kurio-amber"
                     />
                     <span className="min-w-0">
                       <span className="block text-[10px] font-bold">{label}</span>
-                      <span className="mt-1 block text-[8px] text-kurio-text-muted">{detail}</span>
+                      <span className="mt-1 block text-[9px] text-kurio-text-muted">{detail}</span>
                     </span>
                   </label>
                 ))}
               </div>
-            </div>
+            </fieldset>
             <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-kurio-border bg-kurio-bg p-3">
               <p className="inline-flex items-center gap-2 text-[10px]">
                 {connectionState === 'connected' ? (
@@ -511,10 +679,13 @@ export function CheckoutPage() {
               <select
                 aria-label="Simular estado da carteira"
                 value={connectionState}
-                onChange={(event) =>
-                  setConnectionState(event.target.value as WalletConnectionState)
-                }
-                className="h-9 rounded border border-kurio-border bg-kurio-surface px-2 text-[10px]"
+                onChange={(event) => {
+                  const next = event.target.value
+                  if (next === 'connected' || next === 'declined' || next === 'disconnected') {
+                    setConnectionState(next)
+                  }
+                }}
+                className="h-9 rounded border border-kurio-border bg-kurio-surface px-2 text-[10px] focus-visible:outline-2 focus-visible:outline-kurio-amber"
               >
                 <option value="connected">Conectada</option>
                 <option value="declined">Recusada pela carteira</option>
@@ -531,29 +702,30 @@ export function CheckoutPage() {
               {orderError}
             </p>
           )}
-          <button
+          <Button
             type="submit"
+            size="lg"
             disabled={
               orderMutation.isPending ||
-              effectiveReviewRequired ||
+              (effectiveReviewRequired && !orderTimeout) ||
               !quote.items.length
             }
-            className="min-h-12 w-full rounded-lg bg-kurio-amber px-5 py-3 text-sm font-bold text-kurio-bg hover:bg-kurio-amber-hover focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-kurio-amber disabled:cursor-not-allowed disabled:opacity-50"
+            className="w-full rounded-lg"
           >
             {orderMutation.isPending
               ? 'Confirmando…'
               : orderTimeout
                 ? 'Tentar novamente com segurança'
                 : 'Confirmar compra'}
-          </button>
+          </Button>
         </form>
 
-        <aside className="rounded-xl border border-kurio-border bg-kurio-surface p-4 sm:p-6 lg:sticky lg:top-24">
+        <aside aria-label="Resumo do pedido" className="rounded-xl border border-kurio-border bg-kurio-surface p-4 sm:p-6 lg:sticky lg:top-24">
           <h2 className="text-base font-bold">Seus NFTs</h2>
           <div className="mt-4 space-y-3">
             {quote.items.map((item) => (
               <article key={item.nftId} className="flex gap-3 border-b border-kurio-border pb-3">
-                <img src={item.imageUrl} alt="" className="size-16 rounded-lg object-cover" />
+                <img src={item.imageUrl} alt="" width={64} height={64} className="size-16 rounded-lg object-cover" />
                 <div className="min-w-0 flex-1">
                   <p className="line-clamp-2 text-xs font-semibold">{item.title}</p>
                   <p className="mt-1 text-[9px] text-kurio-text-muted">
@@ -581,7 +753,7 @@ export function CheckoutPage() {
             type="button"
             onClick={() => setShowCoupon((open) => !open)}
             aria-expanded={showCoupon}
-            className="mt-4 flex w-full items-center justify-between text-left text-[10px] text-kurio-text-muted hover:text-kurio-text"
+            className="mt-4 flex w-full items-center justify-between text-left text-[10px] text-kurio-text-muted hover:text-kurio-text focus-visible:outline-2 focus-visible:outline-kurio-amber"
           >
             Tem um código promocional? Aplique aqui
             <ChevronDown size={14} aria-hidden="true" />
@@ -594,18 +766,22 @@ export function CheckoutPage() {
                 value={couponDraft}
                 onChange={(event) => setCouponDraft(event.target.value)}
                 placeholder={quote.couponCode ?? 'Código promocional'}
-                className="h-10 min-w-0 flex-1 rounded-lg border border-kurio-border bg-kurio-bg px-3 text-[10px]"
+                aria-invalid={couponError ? true : undefined}
+                aria-describedby={couponError ? 'checkout-coupon-error' : undefined}
+                className="h-10 min-w-0 flex-1 rounded-lg border border-kurio-border bg-kurio-bg px-3 text-[10px] focus-visible:outline-2 focus-visible:outline-kurio-amber aria-invalid:border-kurio-danger"
               />
-              <button
+              <Button
                 type="submit"
+                variant="outline"
+                size="sm"
                 disabled={!couponDraft.trim()}
-                className="rounded-lg border border-kurio-amber px-3 text-[10px] font-bold text-kurio-amber disabled:opacity-50"
+                className="h-10 rounded-lg"
               >
                 Aplicar
-              </button>
+              </Button>
             </form>
           )}
-          {couponError && <p role="alert" className="mt-2 text-[10px] text-kurio-danger">{couponError}</p>}
+          {couponError && <p id="checkout-coupon-error" role="alert" className="mt-2 text-[10px] text-kurio-danger">{couponError}</p>}
           {quote.couponCode && (
             <p className="mt-2 text-[10px] text-kurio-success">
               Cupom {quote.couponCode} aplicado.
@@ -622,7 +798,7 @@ export function CheckoutPage() {
             </div>
             <div className="flex justify-between gap-3">
               <dt className="text-kurio-text-muted">
-                Taxa de rede <span className="block text-[9px]">Taxa estimada</span>
+                Taxa de rede <span className="block text-[9px] text-kurio-amber">Taxa estimada</span>
               </dt>
               <dd>{formatEthDisplay(quote.networkFeeEth)}</dd>
             </div>
@@ -636,14 +812,14 @@ export function CheckoutPage() {
             A cotação será validada novamente ao confirmar.
           </p>
           {wallets.length === 0 && (
-            <Link to="/wallets" className="mt-4 inline-flex items-center gap-2 text-[10px] text-kurio-amber underline">
+            <Link to="/wallets" className="mt-4 inline-flex items-center gap-2 text-[10px] text-kurio-amber underline focus-visible:outline-2 focus-visible:outline-kurio-amber">
               <WalletCards size={13} aria-hidden="true" />
               Cadastrar carteira
             </Link>
           )}
           {orderMutation.isPending && (
             <p role="status" className="mt-3 flex items-center gap-2 text-[10px] text-kurio-text-muted">
-              <LoaderCircle size={13} className="animate-spin" />
+              <LoaderCircle size={13} className="animate-spin motion-reduce:animate-none" aria-hidden="true" />
               Aguardando resposta da rede…
             </p>
           )}

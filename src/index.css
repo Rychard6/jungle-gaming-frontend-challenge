@@ -1,5 +1,41 @@
 @import "tailwindcss";
 
+/*
+ * IBM Plex Mono servida localmente (public/fonts), sem CDN: o desafio exige fontes locais e isso
+ * também elimina a conexão extra que penalizava o LCP. `swap` evita texto invisível durante o carregamento.
+ */
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/ibm-plex-mono-400.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/fonts/ibm-plex-mono-500.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("/fonts/ibm-plex-mono-600.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/ibm-plex-mono-700.woff2") format("woff2");
+}
+
 @theme {
   --font-sans: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -25,6 +61,25 @@
   }
 }
 
+@layer base {
+  html {
+    /* Controles nativos (select, scrollbar, date) acompanham o tema escuro. */
+    color-scheme: dark;
+    background-color: var(--color-kurio-bg);
+  }
+
+  /* Anel de foco padrão para qualquer elemento interativo; componentes podem refinar via utilitários. */
+  :focus-visible {
+    outline: 2px solid var(--color-kurio-amber);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background-color: rgb(212 138 70 / 0.35);
+    color: var(--color-kurio-text);
+  }
+}
+
 body {
   margin: 0;
   overflow-x: hidden;
@@ -46,7 +101,17 @@ body {
   animation: skeleton-shimmer 2s ease-in-out infinite;
 }
 
+/* Respeita "reduzir movimento": remove animações e transições não essenciais em todo o app. */
 @media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
   .skeleton-shimmer {
     animation: none;
   }

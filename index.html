@@ -2,22 +2,31 @@
 <html lang="pt-BR" class="dark">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#140D08" />
     <meta
       name="description"
       content="KURIO — Descubra, colecione e negocie NFTs exclusivos e arte digital verificada na Ethereum, Polygon e Solana."
     />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap"
-      rel="stylesheet"
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="KURIO" />
+    <meta property="og:title" content="KURIO — Marketplace de NFTs" />
+    <meta
+      property="og:description"
+      content="Descubra, colecione e negocie NFTs exclusivos e arte digital verificada na Ethereum, Polygon e Solana."
     />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <!-- Fontes locais (public/fonts): nenhuma dependência de CDN. Só os pesos usados acima da dobra são pré-carregados. -->
+    <link rel="preload" href="/fonts/ibm-plex-mono-400.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="/fonts/ibm-plex-mono-700.woff2" as="font" type="font/woff2" crossorigin />
     <title>KURIO — Marketplace de NFTs</title>
   </head>
   <body>
     <div id="root"></div>
+    <noscript>
+      O marketplace KURIO precisa de JavaScript para funcionar. Ative-o no navegador e recarregue a página.
+    </noscript>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

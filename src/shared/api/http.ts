@@ -2,7 +2,7 @@ import axios, {
   type AxiosError,
   type InternalAxiosRequestConfig,
 } from 'axios'
-import type { MockScenarioId } from './types'
+import { isMockScenarioId, type MockScenarioId } from './types'
 
 const STORAGE_KEYS = {
   authToken: 'kurio_auth_token',
@@ -10,19 +10,6 @@ const STORAGE_KEYS = {
   guestSessionId: 'kurio_guest_session_id',
   mockScenario: 'kurio_mock_scenario',
 } as const
-
-const MOCK_SCENARIOS: readonly MockScenarioId[] = [
-  'default',
-  'slow-network',
-  'out-of-order',
-  'network-error',
-  'server-error-500',
-  'session-expired',
-  'price-change-on-checkout',
-  'edition-sold-out',
-  'order-timeout-recovery',
-  'payment-declined',
-]
 
 type ApiErrorPayload = {
   message?: string
@@ -72,10 +59,6 @@ function getStringRecord(
   return Object.fromEntries(entries) as Record<string, string>
 }
 
-function isMockScenarioId(value: string): value is MockScenarioId {
-  return MOCK_SCENARIOS.some((scenario) => scenario === value)
-}
-
 function createGuestSessionId(): string {
   const cryptoApi = globalThis.crypto
   if (typeof cryptoApi.randomUUID === 'function') {
@@ -88,6 +71,49 @@ function createGuestSessionId(): string {
 
 function getLocalStorage(): Storage | null {
   return typeof window === 'undefined' ? null : window.localStorage
+}
+
+const sessionListeners = new Set<() => void>()
+
+function notifySessionChange(): void {
+  for (const listener of sessionListeners) listener()
+}
+
+function isSessionStorageKey(key: string | null): boolean {
+  return (
+    key === null ||
+    key === STORAGE_KEYS.authToken ||
+    key === STORAGE_KEYS.userId ||
+    key === STORAGE_KEYS.guestSessionId
+  )
+}
+
+/**
+ * Mudanças de identidade feitas por OUTRA aba (evento `storage`): logout ou troca de
+ * usuário lá devem limpar os dados privados exibidos aqui.
+ */
+export function subscribeForeignSessionChange(
+  listener: () => void,
+): () => void {
+  if (typeof window === 'undefined') return () => undefined
+  const onStorage = (event: StorageEvent) => {
+    if (isSessionStorageKey(event.key)) listener()
+  }
+  window.addEventListener('storage', onStorage)
+  return () => window.removeEventListener('storage', onStorage)
+}
+
+/**
+ * Assina mudanças de identidade (login, logout, expiração e outras abas).
+ * Alimenta `useSessionKey`, que mantém as query keys privadas reativas.
+ */
+export function subscribeSessionChange(listener: () => void): () => void {
+  sessionListeners.add(listener)
+  const unsubscribeForeign = subscribeForeignSessionChange(listener)
+  return () => {
+    sessionListeners.delete(listener)
+    unsubscribeForeign()
+  }
 }
 
 export function getGuestSessionId(): string | null {
@@ -106,7 +132,9 @@ export function resetGuestSessionId(): string | null {
   const storage = getLocalStorage()
   if (!storage) return null
   storage.removeItem(STORAGE_KEYS.guestSessionId)
-  return getGuestSessionId()
+  const guestSessionId = getGuestSessionId()
+  notifySessionChange()
+  return guestSessionId
 }
 
 export function getSessionCacheKey(): string | null {
@@ -121,6 +149,10 @@ export function getAuthToken(): string | null {
   return getLocalStorage()?.getItem(STORAGE_KEYS.authToken) ?? null
 }
 
+export function getAuthUserId(): string | null {
+  return getLocalStorage()?.getItem(STORAGE_KEYS.userId) ?? null
+}
+
 export function setAuthSession(
   token: string | null,
   userId: string | null,
@@ -130,22 +162,11 @@ export function setAuthSession(
   if (token === null || userId === null) {
     storage.removeItem(STORAGE_KEYS.authToken)
     storage.removeItem(STORAGE_KEYS.userId)
-    return
+  } else {
+    storage.setItem(STORAGE_KEYS.authToken, token)
+    storage.setItem(STORAGE_KEYS.userId, userId)
   }
-  storage.setItem(STORAGE_KEYS.authToken, token)
-  storage.setItem(STORAGE_KEYS.userId, userId)
-}
-
-export function setAuthToken(token: string | null): void {
-  const storage = getLocalStorage()
-  if (!storage) return
-
-  if (token === null) {
-    storage.removeItem(STORAGE_KEYS.authToken)
-    storage.removeItem(STORAGE_KEYS.userId)
-    return
-  }
-  storage.setItem(STORAGE_KEYS.authToken, token)
+  notifySessionChange()
 }
 
 export function setMockScenario(scenario: MockScenarioId): void {
@@ -154,13 +175,10 @@ export function setMockScenario(scenario: MockScenarioId): void {
   storage.setItem(STORAGE_KEYS.mockScenario, scenario)
 }
 
-function getMockScenario(): MockScenarioId {
+/** Cenário MSW persistido; valores desconhecidos degradam para `default`. */
+export function getStoredMockScenario(): MockScenarioId {
   const storedScenario = getLocalStorage()?.getItem(STORAGE_KEYS.mockScenario)
-  if (storedScenario === null || storedScenario === undefined) return 'default'
-  if (!isMockScenarioId(storedScenario)) {
-    throw new TypeError(`Cenário de mock inválido no armazenamento: ${storedScenario}`)
-  }
-  return storedScenario
+  return isMockScenarioId(storedScenario) ? storedScenario : 'default'
 }
 
 function createApiClientError(error: AxiosError<unknown>): ApiClientError {
@@ -217,7 +235,7 @@ httpClient.interceptors.request.use((config: InternalAxiosRequestConfig) => {
   } else {
     config.headers.delete('x-guest-session-id')
   }
-  config.headers.set('x-mock-scenario', getMockScenario())
+  config.headers.set('x-mock-scenario', getStoredMockScenario())
 
   return config
 })
@@ -231,8 +249,15 @@ httpClient.interceptors.response.use(
 
     const apiError = createApiClientError(error)
     const requestUrl = error.config?.url ?? ''
+    // Só a sessão ATUAL pode "expirar": visitantes não têm sessão, e uma resposta 401 atrasada
+    // de um token antigo (já trocado por login/logout) não pode derrubar o usuário novo.
+    const sentAuthorization = error.config?.headers.get('Authorization')
+    const isCurrentSession =
+      typeof sentAuthorization === 'string' &&
+      sentAuthorization === `Bearer ${getAuthToken() ?? ''}`
     if (
       apiError.status === 401 &&
+      isCurrentSession &&
       !requestUrl.includes('/auth/login') &&
       !requestUrl.includes('/auth/register') &&
       !requestUrl.includes('/auth/logout')

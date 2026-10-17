@@ -20,6 +20,9 @@ const auxiliaryItems = [
   { label: 'Suporte', icon: CircleHelp },
 ] as const
 
+const outOfScopeNotice = (label: string) =>
+  `${label} não faz parte do escopo desta demonstração.`
+
 export function AccountSidebarLayout({
   active,
   children,
@@ -92,11 +95,7 @@ export function AccountSidebarLayout({
                 <button
                   key={label}
                   type="button"
-                  onClick={() =>
-                    setNotice(
-                      `${label} estará disponível em uma próxima etapa do marketplace.`,
-                    )
-                  }
+                  onClick={() => setNotice(outOfScopeNotice(label))}
                   className={`${menuLinkClass(false)} w-full`}
                 >
                   <Icon size={16} aria-hidden="true" />
@@ -110,11 +109,7 @@ export function AccountSidebarLayout({
               <button
                 key={label}
                 type="button"
-                onClick={() =>
-                  setNotice(
-                    `${label} estará disponível em uma próxima etapa do marketplace.`,
-                  )
-                }
+                onClick={() => setNotice(outOfScopeNotice(label))}
                 className="flex min-h-9 shrink-0 items-center gap-1.5 rounded-md border border-kurio-border px-3 text-[10px] text-kurio-text-muted"
               >
                 <Icon size={13} aria-hidden="true" />
@@ -155,7 +150,8 @@ export function AccountSidebarLayout({
                 <button
                   type="button"
                   onClick={() => setNotice('')}
-                  className="shrink-0 underline underline-offset-4"
+                  aria-label="Fechar aviso"
+                  className="shrink-0 underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-kurio-amber"
                 >
                   Fechar
                 </button>

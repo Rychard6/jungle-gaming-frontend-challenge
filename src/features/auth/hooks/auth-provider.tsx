@@ -14,15 +14,18 @@ import {
 import { useNavigate, useRouterState } from '@tanstack/react-router'
 import type {
   AuthResponseDto,
+  AuthSessionResponseDto,
   LoginRequestDto,
   RegisterRequestDto,
 } from '../../../shared/api/types'
 import { AuthContext, type AuthContextValue } from './auth-context'
 import {
+  getAuthUserId,
   getSessionCacheKey,
   resetGuestSessionId,
   setAuthSession,
   setOnUnauthorizedCallback,
+  subscribeForeignSessionChange,
 } from '../../../shared/api/http'
 import { resetSocketSession } from '../../../shared/socket/socket-client'
 import {
@@ -31,8 +34,21 @@ import {
   logout as logoutRequest,
   register as registerRequest,
 } from '../api/auth-api'
+import { redirectFromPath } from '../lib/safe-redirect'
 
 const AUTH_QUERY_KEY = ['auth', 'session'] as const
+
+// Raízes de query cujo conteúdo pertence a uma sessão. Todas carregam a session key em algum
+// ponto da chave (`['order', id, sessionKey]`, `['checkout', 'quote', sessionKey]`, ...).
+const PRIVATE_QUERY_ROOTS: ReadonlySet<unknown> = new Set([
+  'cart',
+  'favorites',
+  'profile',
+  'wallets',
+  'orders',
+  'order',
+  'checkout',
+])
 
 function removePrivateQueries(
   queryClient: ReturnType<typeof useQueryClient>,
@@ -41,12 +57,8 @@ function removePrivateQueries(
   if (!sessionKey) return
   queryClient.removeQueries({
     predicate: (query) =>
-      (query.queryKey[0] === 'cart' ||
-        query.queryKey[0] === 'favorites' ||
-        query.queryKey[0] === 'profile' ||
-        query.queryKey[0] === 'wallets' ||
-        query.queryKey[0] === 'orders') &&
-      query.queryKey[1] === sessionKey,
+      PRIVATE_QUERY_ROOTS.has(query.queryKey[0]) &&
+      query.queryKey.includes(sessionKey),
   })
 }
 
@@ -55,6 +67,7 @@ function storeAuthenticatedSession(
   response: AuthResponseDto,
 ): void {
   const previousSessionKey = getSessionCacheKey()
+  void queryClient.cancelQueries({ queryKey: AUTH_QUERY_KEY })
   setAuthSession(response.session.token, response.session.user.id)
   removePrivateQueries(queryClient, previousSessionKey)
   queryClient.setQueryData(AUTH_QUERY_KEY, {
@@ -73,6 +86,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     select: (state) => `${state.location.pathname}${state.location.searchStr}`,
   })
   const [notice, setNotice] = useState('')
+  const [isReconciling, setIsReconciling] = useState(false)
   const expirationHandled = useRef(false)
 
   const sessionQuery = useQuery({
@@ -102,6 +116,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const clearLocalSession = useCallback(() => {
     const previousSessionKey = getSessionCacheKey()
+    void queryClient.cancelQueries({ queryKey: AUTH_QUERY_KEY })
     setAuthSession(null, null)
     resetGuestSessionId()
     removePrivateQueries(queryClient, previousSessionKey)
@@ -117,7 +132,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setNotice('Sua sessão expirou. Faça login novamente para continuar.')
       void navigate({
         to: '/login',
-        search: { redirect: currentPath, expired: true },
+        search: { redirect: redirectFromPath(currentPath), expired: true },
+        replace: true,
       })
     })
     return () => setOnUnauthorizedCallback(undefined)
@@ -128,6 +144,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (session) resetSocketSession(session.user.id)
   }, [sessionQuery.data?.session])
 
+  // Logout/troca de usuário em outra aba: descarta os dados privados exibidos nesta aba.
+  useEffect(
+    () =>
+      subscribeForeignSessionChange(() => {
+        const storedUserId = getAuthUserId()
+        const knownUserId =
+          queryClient.getQueryData<AuthSessionResponseDto>(AUTH_QUERY_KEY)?.session
+            ?.user.id ?? null
+        if (storedUserId === knownUserId) return
+        setIsReconciling(true)
+        void queryClient.cancelQueries({ queryKey: AUTH_QUERY_KEY })
+        queryClient.removeQueries({
+          predicate: (query) => PRIVATE_QUERY_ROOTS.has(query.queryKey[0]),
+        })
+        queryClient.setQueryData(AUTH_QUERY_KEY, { session: null, wallets: [] })
+        resetSocketSession(storedUserId)
+        void queryClient.fetchQuery({
+          queryKey: AUTH_QUERY_KEY,
+          queryFn: ({ signal }) => fetchAuthSession(signal),
+          staleTime: 0,
+        }).catch(() => undefined).finally(() => setIsReconciling(false))
+      }),
+    [queryClient],
+  )
+
   const logout = useCallback(async () => {
     try {
       await logoutRequest()
@@ -136,13 +177,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [clearLocalSession])
 
+  const { mutateAsync: loginAsync } = loginMutation
+  const { mutateAsync: registerAsync } = registerMutation
   const login = useCallback(
-    (input: LoginRequestDto) => loginMutation.mutateAsync(input),
-    [loginMutation],
+    (input: LoginRequestDto) => loginAsync(input),
+    [loginAsync],
   )
   const register = useCallback(
-    (input: RegisterRequestDto) => registerMutation.mutateAsync(input),
-    [registerMutation],
+    (input: RegisterRequestDto) => registerAsync(input),
+    [registerAsync],
   )
   const switchUser = useCallback(
     async (user: 'nova' | 'kael' | 'guest') => {
@@ -151,7 +194,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setNotice('Sessão de visitante iniciada.')
         return
       }
-      await logout()
+      // Login direto: substitui a sessão sem passar por um estado "deslogado". Um logout
+      // antes faria a página protegida redirecionar para /login e deixaria a troca inacabada.
+      // `storeAuthenticatedSession` já remove os dados privados da sessão anterior.
       await login({
         email:
           user === 'nova' ? 'contato@email.com' : 'colecionador@kurio.io',
@@ -165,28 +210,34 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   )
 
   const clearNotice = useCallback(() => setNotice(''), [])
+  const showNotice = useCallback((message: string) => setNotice(message), [])
   const value = useMemo<AuthContextValue>(
     () => ({
       session: sessionQuery.data?.session ?? null,
       wallets: sessionQuery.data?.wallets ?? [],
-      isLoading: sessionQuery.isLoading,
+      isLoading: sessionQuery.isLoading || isReconciling,
       notice,
       clearNotice,
+      showNotice,
       login,
       register,
       logout,
       switchUser,
+      resetLocalSession: clearLocalSession,
     }),
     [
       sessionQuery.data?.session,
       sessionQuery.data?.wallets,
       sessionQuery.isLoading,
+      isReconciling,
       notice,
       clearNotice,
+      showNotice,
       login,
       register,
       logout,
       switchUser,
+      clearLocalSession,
     ],
   )
 

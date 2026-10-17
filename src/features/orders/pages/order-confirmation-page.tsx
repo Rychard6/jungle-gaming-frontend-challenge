@@ -1,17 +1,31 @@
+import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import { Check, Clock3, Mail, XCircle } from 'lucide-react'
-import { getSessionCacheKey } from '../../../shared/api/http'
-import type { OrderDto } from '../../../shared/api/types'
+import { ApiClientError } from '../../../shared/api/http'
+import { useSessionKey } from '../../../shared/api/use-session-key'
+import type { OrderDto, OrderStatus } from '../../../shared/api/types'
 import { formatEthDisplay } from '../../../shared/lib/eth-math'
+import { useDocumentTitle } from '../../../shared/lib/use-document-title'
+import { buttonVariants } from '../../../shared/ui/button-variants'
+import { Skeleton } from '../../../shared/ui/skeleton'
 import { fetchOrder } from '../api/orders-api'
-import { useState } from 'react'
+
+const STATUS_ANNOUNCEMENTS: Record<OrderStatus, string> = {
+  pending: 'Compra em processamento. Aguardando confirmação da rede.',
+  confirmed: 'Compra confirmada. O recibo está disponível nesta página.',
+  declined: 'Pagamento recusado. Seus itens continuam no carrinho.',
+}
 
 function formatOrderDate(date: string): string {
   return new Intl.DateTimeFormat('pt-BR', {
     dateStyle: 'medium',
     timeStyle: 'short',
   }).format(new Date(date))
+}
+
+function shortenHash(hash: string): string {
+  return `${hash.slice(0, 6)}…${hash.slice(-4)}`
 }
 
 function Receipt({ order }: { order: OrderDto }) {
@@ -39,8 +53,8 @@ function Receipt({ order }: { order: OrderDto }) {
       <dl className="grid gap-px border-y border-kurio-border bg-kurio-border sm:grid-cols-4">
         <div className="bg-kurio-bg px-4 py-4 sm:px-5">
           <dt className="text-[9px] uppercase tracking-wider text-kurio-text-muted">ID da transação</dt>
-          <dd className="mt-2 break-all text-xs font-semibold text-kurio-amber">
-            {order.transactionHash.slice(0, 7)}..{order.transactionHash.slice(-4)}
+          <dd className="mt-2 break-all text-xs font-semibold text-kurio-amber" title={order.transactionHash}>
+            {shortenHash(order.transactionHash)}
           </dd>
         </div>
         <div className="bg-kurio-bg px-4 py-4 sm:px-5">
@@ -55,7 +69,10 @@ function Receipt({ order }: { order: OrderDto }) {
         </div>
         <div className="bg-kurio-bg px-4 py-4 sm:px-5">
           <dt className="text-[9px] uppercase tracking-wider text-kurio-text-muted">Carteira</dt>
-          <dd className="mt-2 break-all text-xs">{order.collector.walletAddress}</dd>
+          <dd className="mt-2 text-xs">{order.walletProvider}</dd>
+          <dd className="mt-1 break-all text-[9px] text-kurio-text-muted">
+            {order.collector.walletAddress}
+          </dd>
         </div>
       </dl>
 
@@ -65,9 +82,9 @@ function Receipt({ order }: { order: OrderDto }) {
           <table className="w-full min-w-[30rem] text-left text-xs">
             <thead>
               <tr className="border-b border-kurio-border text-[9px] uppercase tracking-wider text-kurio-text-muted">
-                <th className="pb-3 font-medium">NFTs</th>
-                <th className="pb-3 font-medium">Edições</th>
-                <th className="pb-3 text-right font-medium">Subtotal</th>
+                <th scope="col" className="pb-3 font-medium">NFTs</th>
+                <th scope="col" className="pb-3 font-medium">Edições</th>
+                <th scope="col" className="pb-3 text-right font-medium">Subtotal</th>
               </tr>
             </thead>
             <tbody>
@@ -78,12 +95,14 @@ function Receipt({ order }: { order: OrderDto }) {
                       <img
                         src={item.imageUrl}
                         alt=""
+                        width={44}
+                        height={44}
                         className="size-11 rounded-lg object-cover"
                       />
                       <span>
                         <span className="block font-semibold">{item.title}</span>
                         <span className="mt-1 block text-[9px] text-kurio-text-muted">
-                          Token {item.tokenId} · {item.editionType}
+                          ID do token: {item.tokenId}
                         </span>
                       </span>
                     </div>
@@ -124,12 +143,12 @@ function Receipt({ order }: { order: OrderDto }) {
             <dd className="text-kurio-amber">{formatEthDisplay(snapshot.totalEth)}</dd>
           </div>
         </dl>
-        <p className="mt-6 rounded-lg border border-kurio-success/30 bg-kurio-success/5 p-4 text-[10px] leading-5 text-kurio-text-muted">
+        <p className="mt-6 rounded-lg border border-kurio-success/30 bg-kurio-success/5 p-4 text-center text-[10px] leading-5 text-kurio-text-muted">
           Transação confirmada na {order.network}. A propriedade foi transferida
           para sua carteira conectada e registrada na rede.
         </p>
         {explorerNotice && (
-          <p role="status" className="mt-3 text-[10px] text-kurio-amber">
+          <p role="status" className="mt-3 text-center text-[10px] text-kurio-amber">
             {explorerNotice}
           </p>
         )}
@@ -141,14 +160,18 @@ function Receipt({ order }: { order: OrderDto }) {
                 `Link simulado do explorador ${order.network}: ${order.transactionHash}`,
               )
             }
-            className="min-h-11 rounded-lg bg-kurio-amber px-6 py-3 text-xs font-bold text-kurio-bg hover:bg-kurio-amber-hover"
+            className={buttonVariants({ size: 'lg', className: 'px-6' })}
           >
             Ver no {order.network === 'Ethereum' ? 'Etherscan' : 'explorador'}
           </button>
           <Link
             to="/"
             search={{ tab: 'all', sort: 'recent', page: 1 }}
-            className="min-h-11 rounded-lg border border-kurio-border px-6 py-3 text-center text-xs font-semibold text-kurio-text"
+            className={buttonVariants({
+              variant: 'secondary',
+              size: 'lg',
+              className: 'px-6 font-semibold',
+            })}
           >
             Continuar explorando
           </Link>
@@ -159,31 +182,47 @@ function Receipt({ order }: { order: OrderDto }) {
 }
 
 export function OrderConfirmationPage({ orderId }: { orderId: string }) {
-  const sessionKey = getSessionCacheKey() ?? 'anonymous'
+  const sessionKey = useSessionKey()
+  useDocumentTitle('Confirmação do pedido — KURIO')
   const orderQuery = useQuery({
     queryKey: ['order', orderId, sessionKey],
     queryFn: ({ signal }) => fetchOrder(orderId, signal),
+    // Rede de segurança caso um evento `order.updated` se perca (ex.: conexão caída).
     refetchInterval: (query) =>
       query.state.data?.status === 'pending' ? 2500 : false,
   })
+  const status = orderQuery.data?.status
+  const [announcedStatus, setAnnouncedStatus] = useState<OrderStatus | null>(null)
+  const [announcement, setAnnouncement] = useState('')
+  // Anuncia cada mudança de estado (inclusive as vindas por Socket.IO) uma única vez.
+  if (status && status !== announcedStatus) {
+    setAnnouncedStatus(status)
+    setAnnouncement(STATUS_ANNOUNCEMENTS[status])
+  }
 
   if (orderQuery.isLoading) {
     return (
       <main aria-busy="true" className="mx-auto max-w-4xl px-4 py-14">
-        <div className="skeleton-shimmer h-[32rem] rounded-2xl" />
+        <span className="sr-only">Carregando pedido…</span>
+        <Skeleton className="h-[32rem] rounded-2xl" />
       </main>
     )
   }
   if (orderQuery.isError || !orderQuery.data) {
+    const forbidden =
+      orderQuery.error instanceof ApiClientError &&
+      orderQuery.error.status === 403
     return (
       <main className="mx-auto max-w-3xl px-4 py-16 text-center">
-        <h1 className="text-2xl font-bold">Pedido indisponível</h1>
+        <h1 className="text-2xl font-bold">
+          {forbidden ? 'Acesso não autorizado' : 'Pedido indisponível'}
+        </h1>
         <p role="alert" className="mt-3 text-sm text-kurio-danger">
           {orderQuery.error instanceof Error
             ? orderQuery.error.message
             : 'Não foi possível carregar este pedido.'}
         </p>
-        <Link to="/profile" className="mt-6 inline-block text-xs text-kurio-amber underline">
+        <Link to="/profile" className="mt-6 inline-block text-xs text-kurio-amber underline focus-visible:outline-2 focus-visible:outline-kurio-amber">
           Voltar ao perfil
         </Link>
       </main>
@@ -193,6 +232,7 @@ export function OrderConfirmationPage({ orderId }: { orderId: string }) {
   const order = orderQuery.data
   return (
     <main className="mx-auto min-h-[60vh] max-w-6xl px-4 py-8 sm:px-8 sm:py-12">
+      <p aria-live="polite" className="sr-only">{announcement}</p>
       {order.status === 'confirmed' ? (
         <Receipt order={order} />
       ) : order.status === 'pending' ? (
@@ -207,6 +247,10 @@ export function OrderConfirmationPage({ orderId }: { orderId: string }) {
           <p className="mt-3 text-sm leading-6 text-kurio-text-muted">
             Aguardando confirmação da rede. Esta página será atualizada assim que
             a transação for concluída.
+          </p>
+          <p className="mt-3 text-[10px] leading-5 text-kurio-text-muted">
+            Se a conexão cair ou você recarregar a página, o estado do pedido é
+            recuperado automaticamente, sem criar uma nova compra.
           </p>
           <p className="mt-5 text-[10px] text-kurio-text-muted">
             Pedido {order.id} · {formatEthDisplay(order.snapshot.totalEth)}
@@ -229,7 +273,7 @@ export function OrderConfirmationPage({ orderId }: { orderId: string }) {
           </p>
           <Link
             to="/checkout"
-            className="mt-7 inline-flex min-h-11 items-center gap-2 rounded-lg bg-kurio-amber px-6 py-3 text-xs font-bold text-kurio-bg"
+            className={buttonVariants({ size: 'lg', className: 'mt-7 px-6' })}
           >
             <Check size={15} aria-hidden="true" />
             Voltar ao checkout

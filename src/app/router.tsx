@@ -2,6 +2,8 @@ import {
   createRootRoute,
   createRoute,
   createRouter,
+  parseSearchWith,
+  stringifySearchWith,
 } from '@tanstack/react-router'
 import {
   NotFoundPage,
@@ -147,9 +149,14 @@ const routeTree = rootRoute.addChildren([
   orderRoute,
 ])
 
+// Search values are plain strings (validated in `validateSearch`). The default
+// serializer JSON-quotes numeric-looking strings (e.g. minPrice="0.5"), so both
+// directions use raw strings here.
 export const router = createRouter({
   routeTree,
   defaultPreload: 'intent',
+  parseSearch: parseSearchWith((value) => value),
+  stringifySearch: stringifySearchWith((value) => String(value)),
 })
 
 declare module '@tanstack/react-router' {

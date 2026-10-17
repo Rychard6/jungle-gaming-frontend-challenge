@@ -49,7 +49,7 @@ O worker é carregado dinamicamente durante a inicialização para não incorpor
 
 ### Autenticação
 
-O token de sessão demonstrativo e o `userId` são armazenados no `localStorage` do browser. As senhas não são persistidas em texto claro: o MockDB as compara por hash determinístico. Isso serve somente às fixtures locais e não substitui hashing seguro, gestão de segredo ou armazenamento de sessão no servidor em uma aplicação de produção.
+O token de sessao demonstrativo e o `userId` sao armazenados no `localStorage`. Senhas usam PBKDF2-SHA256 com 100 mil iteracoes e salt aleatorio para novas senhas; apenas as fixtures possuem salts fixos para reproducao. Isso nao substitui sessao, armazenamento e autorizacao em um servidor de producao.
 
 As rotas de perfil, carteiras, checkout e pedidos exigem sessão. Uma chamada autenticada que retorna `401` aciona o callback central do cliente HTTP:
 
@@ -59,7 +59,7 @@ As rotas de perfil, carteiras, checkout e pedidos exigem sessão. Uma chamada au
 4. direciona para `/login?redirect=<rota-atual>`;
 5. após autenticação, retoma o destino guardado.
 
-Logout e troca de conta também removem as queries privadas da identidade anterior e reinicializam o socket. No login/cadastro, o carrinho da sessão visitante é mesclado ao carrinho da conta, com quantidades limitadas pelo estoque disponível.
+Logout e troca de conta removem as queries privadas da identidade anterior e reinicializam o socket, inclusive entre abas pelo evento `storage`. Paginas privadas remontam por usuario; callbacks de mutacoes verificam a identidade capturada antes de alterar caches ou navegar. No login/cadastro, o carrinho visitante e mesclado ao da conta, limitado pelo estoque.
 
 ### Chaves de cache privadas
 
@@ -130,7 +130,9 @@ O cliente solicita uma cotação e envia `quoteVersion` com os dados do coletor,
 - mesma chave e payload diferente: `409 IDEMPOTENCY_CONFLICT`;
 - timeout transitório: o pedido fica gravado; a repetição com a mesma chave recupera esse pedido.
 
-O pedido armazena `snapshot` com itens, quantidades, preço unitário, subtotais, desconto, taxa e total. O recibo lê exclusivamente esse snapshot; mudanças posteriores no catálogo não alteram o recibo. Uma recusa preserva itens e estoque. Um pedido pendente que depois é recusado repõe os itens/estoque na simulação.
+O pedido armazena `snapshot` com itens, quantidades, preco unitario, subtotais, desconto, taxa e total. O recibo le exclusivamente esse snapshot. Um pedido pendente reserva estoque, mas preserva o carrinho. A confirmacao remove somente as quantidades compradas, mantendo adicoes posteriores. A recusa devolve o estoque reservado, sem duplicar itens no carrinho. Reservas e devolucoes emitem `nft.updated`.
+
+Uma nova chave nao cria outra compra enquanto existe pedido pendente (`409 ORDER_PENDING`). O checkout recupera pedidos pendentes mesmo com carrinho preenchido. Repeticoes apos timeout reutilizam a chave e o payload original; dados invalidos do coletor sao rejeitados por validacao compartilhada entre UI e handlers REST.
 
 ## Socket.IO e reconciliação
 
@@ -150,7 +152,7 @@ interface EventEnvelope<TType, TPayload> {
 
 ### `nft.updated`
 
-Payload: `{ nftId, priceEth, availableEditions, editionType }`. O cliente atualiza os caches de catálogo e detalhe correspondentes, invalida carrinho/cotação e notifica a tela de checkout. A alteração exige confirmação explícita antes de enviar o pedido.
+Payload: `{ nftId, priceEth, availableEditions, editionType }`. O cliente cancela consultas publicas em voo, atualiza os caches conhecidos e invalida listas para recomputar ordenacao, filtros e paginacao, alem de carrinho/cotacao. A alteracao exige confirmacao explicita antes de enviar o pedido.
 
 ### `order.updated`
 
@@ -160,9 +162,11 @@ REST permanece a fonte de verdade recuperável. Eventos aceleram a atualização
 
 ## Política de cache do TanStack Query
 
+- `staleTime` padrao: 30 segundos; `gcTime`: 5 minutos. Sem refetch ao focar a janela; reconexao revalida dados ativos. Consultas de recuperacao de pedidos usam `staleTime: 0`.
+- Queries repetem uma vez falhas de rede/5xx, nunca 4xx; mutations nao possuem repeticao automatica.
 - Dados públicos do catálogo e detalhe são cacheados por parâmetros/ID do recurso; o socket atualiza o que sabe e invalida recursos dependentes.
 - Favoritos, carrinho, perfil, carteiras e pedidos carregam o escopo da sessão na query key.
-- Favoritos usam atualização otimista com rollback quando a mutação falha.
+- Favoritos usam atualizacao otimista com rollback por NFT, sem substituir a lista de outras mutacoes concorrentes.
 - Mutação de carrinho invalida/refaz a consulta para obter totais e disponibilidade autoritativos do MockDB.
 - Perfil e carteiras são atualizados no cache após mutation para refletir alterações imediatamente e após recarga.
 - Eventos de pedido atualizam/invalida caches; reconnect invalida consultas ativas de pedidos e busca o estado atual na API.
@@ -171,9 +175,11 @@ REST permanece a fonte de verdade recuperável. Eventos aceleram a atualização
 ## Limitações conhecidas e decisões de UX
 
 - MSW/MockDB, sessão, Socket.IO, pagamentos, estados de carteira e links de explorador são simulações no browser. Não há persistência multi-dispositivo, validação de autorização no servidor real ou transação blockchain.
-- O hash determinístico de senha é apropriado somente para fixtures simuladas; produção exige hashing criptográfico com salt, armazenamento no servidor e controles de autenticação apropriados.
+- A persistencia local valida estruturas antes de aceita-las; dados corrompidos voltam ao estado demonstrativo seguro. Nao ha migracao ou recuperacao de registros locais invalidos.
 - A toolbar de desenvolvimento expõe controles de reset, troca de usuário e simulação; não deve ser habilitada como ferramenta operacional em um produto publicado.
 - A autenticação Google/Facebook é indicativa, não executa OAuth.
 - Checkout bloqueia envio em caso de cotação desatualizada ou carteira desconectada/recusada e pede revisão explícita; erro de rede e recusas mantêm contexto para nova tentativa.
 - Login/cadastro e filtros móveis implementam Escape e foco visível/contido; erros da API são apresentados junto ao formulário e associados aos campos quando aplicável.
 - A implementação prioriza estados de carregamento, erro, vazio, sessão expirada, pedido pendente e pagamento recusado em vez de exibir sucesso presumido.
+- Dialogos tornam o fundo `inert`, filtram controles invisiveis e restauram foco. Filtros preservam o acionador ao aplicar precos. A toolbar fechada ocupa apenas um icone no mobile.
+- Evidencias, ambiente de medicao e pendencias de performance/deploy estao no README e em `reports/lighthouse/`; nao ha afirmacao de conformidade integral enquanto os gates mobile falharem.

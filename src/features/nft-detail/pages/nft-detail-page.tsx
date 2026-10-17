@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { useNavigate, useParams } from '@tanstack/react-router'
+import { Link, useNavigate, useParams } from '@tanstack/react-router'
 import {
   ArrowLeft,
   Copy,
@@ -11,7 +11,12 @@ import {
   ShoppingBag,
 } from 'lucide-react'
 import { ApiClientError } from '../../../shared/api/http'
+import { NFT_EDITION_TYPES } from '../../../shared/api/types'
 import { formatEthDisplay } from '../../../shared/lib/eth-math'
+import { useDocumentTitle } from '../../../shared/lib/use-document-title'
+import { Button } from '../../../shared/ui/button'
+import { buttonVariants } from '../../../shared/ui/button-variants'
+import { Skeleton } from '../../../shared/ui/skeleton'
 import { NftCard } from '../../catalog/components/nft-card'
 import { useFavorites } from '../../favorites/hooks/use-favorites'
 import { useCart } from '../../cart/hooks/use-cart'
@@ -20,6 +25,29 @@ import {
   fetchNftDetail,
 } from '../api/nft-detail-api'
 import { NftGallery } from '../components/nft-gallery'
+
+const HOME_SEARCH = { tab: 'all', sort: 'recent', page: 1 } as const
+
+function formatEditions(count: number): string {
+  return `${count} ${count === 1 ? 'edição' : 'edições'}`
+}
+
+function DetailSkeleton() {
+  return (
+    <main aria-busy="true" className="mx-auto max-w-7xl px-5 py-12 sm:px-8">
+      <span className="sr-only">Carregando NFT…</span>
+      <div className="grid gap-8 lg:grid-cols-[minmax(0,1.05fr)_minmax(0,0.95fr)] lg:gap-12">
+        <Skeleton className="aspect-square w-full rounded-2xl" />
+        <div className="space-y-5 py-3">
+          <Skeleton className="h-4 w-1/3" />
+          <Skeleton className="h-9 w-3/4" />
+          <Skeleton className="h-28 w-full" />
+          <Skeleton className="h-16 w-full" />
+        </div>
+      </div>
+    </main>
+  )
+}
 
 export function NftDetailPage() {
   const { nftId } = useParams({ from: '/nfts/$nftId' })
@@ -39,6 +67,7 @@ export function NftDetailPage() {
     queryFn: ({ signal }) => fetchNftDetail(nftId, signal),
   })
   const nft = nftQuery.data
+  useDocumentTitle(nft ? `${nft.title} — KURIO` : 'NFT — KURIO')
   const collectionQuery = useQuery({
     queryKey: ['nft-collection', nft?.collectionName],
     queryFn: ({ signal }) => fetchCollectionNfts(nft?.collectionName ?? '', signal),
@@ -47,8 +76,19 @@ export function NftDetailPage() {
   const favorites = useFavorites(nft?.id ?? '')
   const cart = useCart()
 
+  const inCartQuantity =
+    cart.cart?.items.find((item) => item.nftId === nft?.id)?.quantity ?? 0
+  const remainingEditions = Math.max(
+    0,
+    (nft?.availableEditions ?? 0) - inCartQuantity,
+  )
+  const selectedQuantity =
+    remainingEditions > 0
+      ? Math.min(Math.max(quantity, 1), remainingEditions)
+      : 0
+
   const addToCart = async (goToCart = false) => {
-    if (!nft) return
+    if (!nft || selectedQuantity < 1) return
     try {
       await cart.addItemAsync({
         nftId: nft.id,
@@ -57,7 +97,7 @@ export function NftDetailPage() {
       })
       setFeedback({
         nftId,
-        notice: `${selectedQuantity} edição(ões) de ${nft.title} adicionada(s) ao carrinho.`,
+        notice: `${formatEditions(selectedQuantity)} de ${nft.title} adicionada(s) ao carrinho.`,
         error: '',
       })
       if (goToCart) {
@@ -88,21 +128,7 @@ export function NftDetailPage() {
     }
   }
 
-  if (nftQuery.isLoading) {
-    return (
-      <main className="mx-auto max-w-7xl px-5 py-12 sm:px-8">
-        <div className="grid animate-pulse gap-8 lg:grid-cols-2">
-          <div className="aspect-square rounded-2xl bg-kurio-surface" />
-          <div className="space-y-5 py-3">
-            <div className="h-4 w-1/3 rounded bg-kurio-surface" />
-            <div className="h-9 w-3/4 rounded bg-kurio-surface" />
-            <div className="h-28 rounded bg-kurio-surface" />
-            <div className="h-16 rounded bg-kurio-surface" />
-          </div>
-        </div>
-      </main>
-    )
-  }
+  if (nftQuery.isLoading) return <DetailSkeleton />
 
   if (nftQuery.isError) {
     const isNotFound =
@@ -121,55 +147,58 @@ export function NftDetailPage() {
           {nftQuery.error.message}
         </p>
         {!isNotFound && (
-          <button
-            type="button"
+          <Button
+            variant="outline"
             onClick={() => void nftQuery.refetch()}
-            className="mt-6 rounded-md border border-kurio-amber px-4 py-2.5 text-xs font-semibold text-kurio-amber focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-kurio-amber"
+            className="mt-6"
           >
             Tentar novamente
-          </button>
+          </Button>
         )}
-        <button
-          type="button"
-          onClick={() =>
-            void navigate({
-              to: '/',
-              search: { tab: 'all', sort: 'recent', page: 1 },
-            })
-          }
-          className="mx-auto mt-6 flex items-center gap-2 rounded-md bg-kurio-amber px-4 py-2.5 text-xs font-bold text-kurio-bg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-kurio-amber"
+        <Link
+          to="/"
+          search={HOME_SEARCH}
+          className={buttonVariants({ className: 'mx-auto mt-6 flex w-fit' })}
         >
           <ArrowLeft size={15} aria-hidden="true" />
           Voltar ao catálogo
-        </button>
+        </Link>
       </main>
     )
   }
 
   if (!nft) return null
 
-  const selectedQuantity =
-    nft.availableEditions > 0
-      ? Math.min(Math.max(quantity, 1), nft.availableEditions)
-      : 0
+  const soldOut = nft.availableEditions < 1
+  const cartHoldsEverything = !soldOut && remainingEditions < 1
+  const atQuantityLimit = remainingEditions > 0 && selectedQuantity >= remainingEditions
   const relatedNfts =
     collectionQuery.data?.filter((item) => item.id !== nft.id) ?? []
+  const availabilityMessage = soldOut
+    ? 'Edição esgotada: esta peça não está mais disponível para compra.'
+    : cartHoldsEverything
+      ? `Você já tem ${formatEditions(inCartQuantity)} no carrinho, o máximo disponível.`
+      : atQuantityLimit
+        ? `Limite de ${formatEditions(remainingEditions)} para este NFT atingido.`
+        : `${nft.availableEditions} disponíveis`
 
   return (
     <main className="mx-auto max-w-7xl px-4 py-7 sm:px-8 sm:py-12">
-      <button
-        type="button"
-        onClick={() =>
-          void navigate({
-            to: '/',
-            search: { tab: 'all', sort: 'recent', page: 1 },
-          })
-        }
-        className="mb-6 inline-flex items-center gap-2 text-xs text-kurio-text-muted hover:text-kurio-amber focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-kurio-amber sm:mb-8"
+      <nav aria-label="Breadcrumb" className="mb-4 hidden text-[10px] text-kurio-text-muted sm:block">
+        <Link to="/" search={HOME_SEARCH} className="hover:text-kurio-amber">Início</Link>
+        <span className="mx-2" aria-hidden="true">/</span>
+        <Link to="/" search={HOME_SEARCH} hash="catalogo" className="hover:text-kurio-amber">Mercado</Link>
+        <span className="mx-2" aria-hidden="true">/</span>
+        <span aria-current="page" className="text-kurio-text">{nft.title}</span>
+      </nav>
+      <Link
+        to="/"
+        search={HOME_SEARCH}
+        className="mb-6 inline-flex items-center gap-2 rounded text-xs text-kurio-text-muted hover:text-kurio-amber focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-kurio-amber sm:mb-8"
       >
         <ArrowLeft size={15} aria-hidden="true" />
         Voltar ao catálogo
-      </button>
+      </Link>
 
       <div className="grid items-start gap-8 lg:grid-cols-[minmax(0,1.05fr)_minmax(0,0.95fr)] lg:gap-12">
         <NftGallery
@@ -189,7 +218,7 @@ export function NftDetailPage() {
                 {nft.title}
               </h1>
               <p className="mt-3 text-xs text-kurio-text-muted">
-                <span className="text-kurio-amber" aria-label={`${nft.rating} de 5 estrelas`}>
+                <span role="img" className="text-kurio-amber" aria-label={`${nft.rating} de 5 estrelas`}>
                   ★
                 </span>{' '}
                 {nft.rating.toFixed(1)} ({nft.reviewsCount} avaliações de colecionadores)
@@ -230,13 +259,38 @@ export function NftDetailPage() {
             {nft.longDescription}
           </p>
 
-          <div className="mt-6 flex flex-wrap gap-2" aria-label="Tipo de edição">
-            <span className="rounded-full border border-kurio-amber/60 bg-kurio-amber/10 px-3 py-1.5 text-[10px] font-semibold text-kurio-amber">
-              {nft.editionType}
-            </span>
-            <span className="rounded-full border border-kurio-border px-3 py-1.5 text-[10px] text-kurio-text-muted">
-              {nft.availableEditions} disponíveis
-            </span>
+          <div className="mt-6">
+            <p id="edition-label" className="text-[10px] uppercase tracking-wider text-kurio-text-muted">
+              Edição
+            </p>
+            <div role="radiogroup" aria-labelledby="edition-label" className="mt-2 flex flex-wrap gap-2">
+              {NFT_EDITION_TYPES.map((edition) => {
+                const isCurrent = edition === nft.editionType
+                return (
+                  <button
+                    key={edition}
+                    type="button"
+                    role="radio"
+                    aria-checked={isCurrent}
+                    disabled={!isCurrent}
+                    title={isCurrent ? undefined : 'Edição indisponível para esta peça'}
+                    className={`rounded-full border px-3 py-1.5 text-[10px] font-semibold ${
+                      isCurrent
+                        ? 'border-kurio-amber/60 bg-kurio-amber/10 text-kurio-amber'
+                        : 'border-kurio-border text-kurio-text-muted line-through opacity-50'
+                    }`}
+                  >
+                    {edition}
+                  </button>
+                )
+              })}
+            </div>
+            <p
+              aria-live="polite"
+              className={`mt-3 text-xs ${soldOut ? 'font-semibold text-kurio-danger' : 'text-kurio-text-muted'}`}
+            >
+              {availabilityMessage}
+            </p>
           </div>
 
           <div className="mt-7 rounded-xl border border-kurio-border bg-kurio-surface p-4 sm:p-5">
@@ -275,12 +329,12 @@ export function NftDetailPage() {
                   <button
                     type="button"
                     aria-label={`Aumentar quantidade de ${nft.title}`}
-                    disabled={selectedQuantity >= nft.availableEditions}
+                    disabled={selectedQuantity >= remainingEditions}
                     onClick={() =>
                       setQuantityState((current) => ({
                         nftId,
                         quantity: Math.min(
-                          nft.availableEditions,
+                          remainingEditions,
                           (current.nftId === nftId ? current.quantity : 1) + 1,
                         ),
                       }))
@@ -293,24 +347,25 @@ export function NftDetailPage() {
               </div>
             </div>
             <div className="mt-5 grid gap-2 sm:grid-cols-2">
-              <button
-                type="button"
-                disabled={nft.availableEditions < 1 || cart.isMutating}
+              <Button
+                size="lg"
+                disabled={remainingEditions < 1 || cart.isMutating}
                 onClick={() => void addToCart(true)}
-                className="inline-flex min-h-11 items-center justify-center gap-2 rounded-md bg-kurio-amber px-4 py-3 text-xs font-bold text-kurio-bg hover:bg-kurio-amber-hover focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-kurio-amber disabled:cursor-not-allowed disabled:opacity-50"
+                className="min-h-11"
               >
                 <ShoppingBag size={16} aria-hidden="true" />
                 Comprar agora
-              </button>
-              <button
-                type="button"
-                disabled={nft.availableEditions < 1 || cart.isMutating}
+              </Button>
+              <Button
+                variant="outline"
+                size="lg"
+                disabled={remainingEditions < 1 || cart.isMutating}
                 onClick={() => void addToCart()}
-                className="inline-flex min-h-11 items-center justify-center gap-2 rounded-md border border-kurio-amber px-4 py-3 text-xs font-semibold text-kurio-amber hover:bg-kurio-amber/10 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-kurio-amber disabled:cursor-not-allowed disabled:opacity-50"
+                className="min-h-11 font-semibold"
               >
                 <ShoppingBag size={16} aria-hidden="true" />
                 Adicionar ao carrinho
-              </button>
+              </Button>
             </div>
             {notice && (
               <p role="status" className="mt-3 text-xs text-kurio-success">
@@ -338,8 +393,12 @@ export function NftDetailPage() {
               <dd className="mt-1 font-semibold text-kurio-text">{nft.network}</dd>
             </div>
             <div>
+              <dt className="text-[10px] uppercase text-kurio-text-muted">Direitos autorais</dt>
+              <dd className="mt-1 font-semibold text-kurio-text">{nft.creatorRoyaltyPercent}%</dd>
+            </div>
+            <div className="col-span-2">
               <dt className="text-[10px] uppercase text-kurio-text-muted">Contrato</dt>
-              <dd className="mt-1 truncate font-semibold text-kurio-text" title={nft.contractAddress}>
+              <dd className="mt-1 break-all font-semibold text-kurio-text">
                 {nft.contractAddress}
               </dd>
             </div>
@@ -363,13 +422,13 @@ export function NftDetailPage() {
 
           <div className="mt-6 flex flex-wrap items-center gap-3 border-t border-kurio-border pt-5">
             <span className="mr-1 text-[10px] uppercase tracking-wider text-kurio-text-muted">
-              Compartilhar
+              Compartilhar este NFT
             </span>
             <a
-              href={`https://twitter.com/intent/tweet?url=${encodeURIComponent(typeof window === 'undefined' ? '' : window.location.href)}&text=${encodeURIComponent(nft.title)}`}
+              href={`https://twitter.com/intent/tweet?url=${encodeURIComponent(window.location.href)}&text=${encodeURIComponent(nft.title)}`}
               target="_blank"
               rel="noreferrer"
-              aria-label={`Compartilhar ${nft.title} no X`}
+              aria-label={`Compartilhar ${nft.title} no X (abre em nova aba)`}
               className="inline-flex items-center gap-2 rounded-md border border-kurio-border px-3 py-2 text-[10px] text-kurio-text hover:border-kurio-amber focus-visible:outline-2 focus-visible:outline-kurio-amber"
             >
               <Share2 size={14} aria-hidden="true" />
@@ -399,7 +458,12 @@ export function NftDetailPage() {
           </div>
         </div>
         {collectionQuery.isLoading ? (
-          <p className="text-xs text-kurio-text-muted">Carregando itens da coleção…</p>
+          <div aria-busy="true" className="grid grid-cols-2 gap-3 md:grid-cols-3 md:gap-5">
+            <span className="sr-only">Carregando itens da coleção…</span>
+            {Array.from({ length: 3 }, (_, index) => (
+              <Skeleton key={index} className="aspect-[0.85] w-full rounded-xl" />
+            ))}
+          </div>
         ) : collectionQuery.isError ? (
           <p role="alert" className="text-xs text-kurio-danger">
             Não foi possível carregar os outros itens desta coleção.

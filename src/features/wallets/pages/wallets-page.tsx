@@ -1,15 +1,25 @@
-import { useState, type FormEvent } from 'react'
+import { useId, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Plus, Trash2, WalletCards } from 'lucide-react'
 import { ApiClientError, getSessionCacheKey } from '../../../shared/api/http'
-import type {
-  BlockchainNetwork,
-  AuthSessionResponseDto,
-  UserProfileDto,
-  WalletDto,
-  WalletInputDto,
-  WalletProviderType,
+import { useSessionKey } from '../../../shared/api/use-session-key'
+import {
+  BLOCKCHAIN_NETWORKS,
+  WALLET_PROVIDER_TYPES,
+  type AuthSessionResponseDto,
+  type UserProfileDto,
+  type WalletDto,
+  type WalletInputDto,
 } from '../../../shared/api/types'
+import { useDocumentTitle } from '../../../shared/lib/use-document-title'
+import {
+  ENS_DOMAINS,
+  validateWallet,
+  type FieldErrors,
+} from '../../../shared/lib/validation'
+import { Button } from '../../../shared/ui/button'
+import { Dialog } from '../../../shared/ui/dialog'
+import { Skeleton } from '../../../shared/ui/skeleton'
 import { useAuth } from '../../auth/hooks/auth-context'
 import {
   createWallet,
@@ -19,6 +29,20 @@ import {
   type WalletsResponse,
 } from '../api/wallets-api'
 import { AccountSidebarLayout } from '../../profile/components/account-sidebar-layout'
+
+const inputClass =
+  'mt-2 h-11 w-full rounded-lg border border-kurio-border bg-kurio-bg px-3 text-sm text-kurio-text placeholder:text-kurio-text-muted focus-visible:outline-2 focus-visible:outline-kurio-amber aria-invalid:border-kurio-danger'
+const labelClass = 'block text-xs font-semibold text-kurio-text'
+
+interface WalletRequest {
+  wallet: WalletDto | null
+  input: WalletInputDto
+  delete?: boolean
+}
+
+function messageOf(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback
+}
 
 function walletToInput(wallet: WalletDto): WalletInputDto {
   return {
@@ -62,203 +86,264 @@ function emptyWallet(
   }
 }
 
+/** Remove espaços acidentais antes de validar/enviar (o servidor trata o valor como está). */
+function normalizeDraft(draft: WalletInputDto): WalletInputDto {
+  const { secondaryAddressOrEns, ...rest } = draft
+  const secondary = secondaryAddressOrEns?.trim()
+  return {
+    ...rest,
+    displayName: rest.displayName.trim(),
+    walletNickname: rest.walletNickname.trim(),
+    profileName: rest.profileName.trim(),
+    address: rest.address.trim(),
+    referralCode: rest.referralCode.trim(),
+    email: rest.email.trim(),
+    ensName: rest.ensName.trim(),
+    ...(secondary ? { secondaryAddressOrEns: secondary } : {}),
+  }
+}
+
+function Field({
+  id,
+  label,
+  error,
+  children,
+}: {
+  id: string
+  label: string
+  error: string | undefined
+  children: ReactNode
+}) {
+  return (
+    <div>
+      <label htmlFor={id} className={labelClass}>
+        {label}
+      </label>
+      {children}
+      {error && (
+        <p id={`${id}-error`} className="mt-1 text-[10px] text-kurio-danger">
+          {error}
+        </p>
+      )}
+    </div>
+  )
+}
+
 function WalletEditor({
-  wallet,
   initialValue,
   busy,
   onSave,
   onDelete,
   onMakePrimary,
 }: {
-  wallet: WalletDto | null
   initialValue: WalletInputDto
   busy: boolean
   onSave: (input: WalletInputDto) => Promise<void>
   onDelete?: () => void
   onMakePrimary?: () => void
 }) {
+  const baseId = useId()
+  const formRef = useRef<HTMLFormElement>(null)
   const [draft, setDraft] = useState(initialValue)
   const [error, setError] = useState('')
-  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({})
+  const [fieldErrors, setFieldErrors] = useState<FieldErrors>({})
 
   const setField = <K extends keyof WalletInputDto>(
     field: K,
     value: WalletInputDto[K],
   ) => setDraft((current) => ({ ...current, [field]: value }))
 
+  const showErrors = (errors: FieldErrors) => {
+    setFieldErrors(errors)
+    const firstInvalid = Object.keys(errors)[0]
+    if (firstInvalid) {
+      formRef.current
+        ?.querySelector<HTMLElement>(`[name="${firstInvalid}"]`)
+        ?.focus()
+    }
+  }
+
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     setError('')
+    const normalized = normalizeDraft(draft)
+    const clientErrors = validateWallet(normalized)
+    if (Object.keys(clientErrors).length > 0) {
+      showErrors(clientErrors)
+      return
+    }
     setFieldErrors({})
     try {
-      await onSave(draft)
+      await onSave(normalized)
     } catch (requestError) {
       if (requestError instanceof ApiClientError) {
         setError(requestError.message)
-        setFieldErrors(requestError.fieldErrors ?? {})
+        showErrors(requestError.fieldErrors ?? {})
       } else {
-        setError(
-          requestError instanceof Error
-            ? requestError.message
-            : 'Não foi possível salvar a carteira.',
-        )
+        setError(messageOf(requestError, 'Não foi possível salvar a carteira.'))
       }
     }
   }
 
-  const inputClass =
-    'mt-2 h-11 w-full rounded-lg border border-kurio-border bg-kurio-bg px-3 text-sm text-kurio-text focus-visible:outline-2 focus-visible:outline-kurio-amber'
-  const labelClass = 'block text-xs font-semibold text-kurio-text'
-  const showFieldError = (field: keyof WalletInputDto) =>
-    fieldErrors[field] ? (
-      <span className="mt-1 block text-[10px] text-kurio-danger">
-        {fieldErrors[field]}
-      </span>
-    ) : null
+  const fieldProps = (name: keyof WalletInputDto) => ({
+    id: `${baseId}-${name}`,
+    name,
+    'aria-invalid': fieldErrors[name] ? true : undefined,
+    'aria-describedby': fieldErrors[name] ? `${baseId}-${name}-error` : undefined,
+  })
 
   return (
     <form
+      ref={formRef}
       onSubmit={(event) => void submit(event)}
+      noValidate
       className="rounded-xl border border-kurio-border bg-kurio-surface p-4 sm:p-6"
     >
       <div className="grid gap-5 sm:grid-cols-2">
-        <label className={labelClass}>
-          Nome de exibição *
+        <Field id={`${baseId}-displayName`} label="Nome de exibição *" error={fieldErrors.displayName}>
           <input
+            {...fieldProps('displayName')}
             value={draft.displayName}
             onChange={(event) => setField('displayName', event.target.value)}
-            required
+            aria-required="true"
             className={inputClass}
-            aria-invalid={Boolean(fieldErrors.displayName)}
           />
-          {showFieldError('displayName')}
-        </label>
-        <label className={labelClass}>
-          Apelido da carteira *
+        </Field>
+        <Field id={`${baseId}-walletNickname`} label="Apelido da carteira *" error={fieldErrors.walletNickname}>
           <input
+            {...fieldProps('walletNickname')}
             value={draft.walletNickname}
             onChange={(event) => setField('walletNickname', event.target.value)}
-            required
+            aria-required="true"
             className={inputClass}
-            aria-invalid={Boolean(fieldErrors.walletNickname)}
           />
-          {showFieldError('walletNickname')}
-        </label>
-        <label className={labelClass}>
-          Rede *
+        </Field>
+        <Field id={`${baseId}-network`} label="Rede *" error={undefined}>
           <select
+            {...fieldProps('network')}
             value={draft.network}
-            onChange={(event) =>
-              setField('network', event.target.value as BlockchainNetwork)
-            }
+            onChange={(event) => {
+              const network = BLOCKCHAIN_NETWORKS.find(
+                (item) => item === event.target.value,
+              )
+              if (network) setField('network', network)
+            }}
             className={inputClass}
           >
-            <option>Ethereum</option>
-            <option>Polygon</option>
-            <option>Solana</option>
+            {BLOCKCHAIN_NETWORKS.map((network) => (
+              <option key={network}>{network}</option>
+            ))}
           </select>
-        </label>
-        <label className={labelClass}>
-          Nome do perfil *
+        </Field>
+        <Field id={`${baseId}-profileName`} label="Nome do perfil *" error={fieldErrors.profileName}>
           <input
+            {...fieldProps('profileName')}
             value={draft.profileName}
             onChange={(event) => setField('profileName', event.target.value)}
-            required
+            aria-required="true"
             className={inputClass}
           />
-        </label>
-        <label className={labelClass}>
-          Endereço da carteira *
+        </Field>
+        <Field id={`${baseId}-address`} label="Endereço da carteira *" error={fieldErrors.address}>
           <input
+            {...fieldProps('address')}
             value={draft.address}
             onChange={(event) => setField('address', event.target.value)}
-            required
             placeholder="Endereço 0x da carteira"
+            autoComplete="off"
+            spellCheck={false}
+            aria-required="true"
             className={inputClass}
-            aria-invalid={Boolean(fieldErrors.address)}
-            aria-describedby={fieldErrors.address ? 'wallet-address-error' : undefined}
           />
-          {fieldErrors.address && (
-            <span id="wallet-address-error" className="mt-1 block text-[10px] text-kurio-danger">
-              {fieldErrors.address}
-            </span>
-          )}
-        </label>
-        <label className={labelClass}>
-          ENS ou carteira secundária (opcional)
+        </Field>
+        <Field
+          id={`${baseId}-secondaryAddressOrEns`}
+          label="ENS ou carteira secundária (opcional)"
+          error={fieldErrors.secondaryAddressOrEns}
+        >
           <input
+            {...fieldProps('secondaryAddressOrEns')}
             value={draft.secondaryAddressOrEns ?? ''}
             onChange={(event) =>
-              setField(
-                'secondaryAddressOrEns',
-                event.target.value || undefined,
-              )
+              setField('secondaryAddressOrEns', event.target.value || undefined)
             }
             placeholder="nome.eth ou endereço 0x"
+            autoComplete="off"
+            spellCheck={false}
             className={inputClass}
-            aria-invalid={Boolean(fieldErrors.secondaryAddressOrEns)}
           />
-          {showFieldError('secondaryAddressOrEns')}
-        </label>
-        <label className={labelClass}>
-          Tipo de carteira *
+        </Field>
+        <Field id={`${baseId}-walletType`} label="Tipo de carteira *" error={undefined}>
           <select
+            {...fieldProps('walletType')}
             value={draft.walletType}
-            onChange={(event) =>
-              setField('walletType', event.target.value as WalletProviderType)
-            }
+            onChange={(event) => {
+              const walletType = WALLET_PROVIDER_TYPES.find(
+                (item) => item === event.target.value,
+              )
+              if (walletType) setField('walletType', walletType)
+            }}
             className={inputClass}
           >
-            <option>MetaMask</option>
-            <option>WalletConnect</option>
-            <option>Coinbase Wallet</option>
+            {WALLET_PROVIDER_TYPES.map((walletType) => (
+              <option key={walletType}>{walletType}</option>
+            ))}
           </select>
-        </label>
-        <label className={labelClass}>
-          Código de indicação *
+        </Field>
+        <Field id={`${baseId}-referralCode`} label="Código de indicação *" error={fieldErrors.referralCode}>
           <input
+            {...fieldProps('referralCode')}
             value={draft.referralCode}
             onChange={(event) => setField('referralCode', event.target.value)}
-            required
+            autoComplete="off"
+            aria-required="true"
             className={inputClass}
           />
-        </label>
-        <label className={labelClass}>
-          E-mail *
+        </Field>
+        <Field id={`${baseId}-email`} label="E-mail *" error={fieldErrors.email}>
           <input
+            {...fieldProps('email')}
             type="email"
             value={draft.email}
             onChange={(event) => setField('email', event.target.value)}
-            required
+            autoComplete="email"
+            aria-required="true"
             className={inputClass}
-            aria-invalid={Boolean(fieldErrors.email)}
           />
-          {showFieldError('email')}
-        </label>
+        </Field>
         <fieldset>
           <legend className={labelClass}>Nome ENS *</legend>
           <div className="mt-2 flex gap-2">
-            <input
-              value={draft.ensName}
-              onChange={(event) => setField('ensName', event.target.value)}
-              required
-              aria-label="Nome ENS"
-              className={`${inputClass} mt-0 min-w-0 flex-1`}
-              aria-invalid={Boolean(fieldErrors.ensName)}
-            />
             <select
+              name="ensDomain"
               value={draft.ensDomain}
               onChange={(event) => setField('ensDomain', event.target.value)}
               aria-label="Domínio ENS"
               className="h-11 rounded-lg border border-kurio-border bg-kurio-bg px-2 text-xs text-kurio-text focus-visible:outline-2 focus-visible:outline-kurio-amber"
             >
-              <option value=".eth">.eth</option>
-              <option value=".kurio">.kurio</option>
-              <option value=".xyz">.xyz</option>
+              {ENS_DOMAINS.map((domain) => (
+                <option key={domain} value={domain}>{domain}</option>
+              ))}
             </select>
+            <input
+              name="ensName"
+              value={draft.ensName}
+              onChange={(event) => setField('ensName', event.target.value)}
+              aria-label="Nome ENS"
+              aria-required="true"
+              aria-invalid={fieldErrors.ensName ? true : undefined}
+              aria-describedby={fieldErrors.ensName ? `${baseId}-ensName-error` : undefined}
+              className={`${inputClass} mt-0 min-w-0 flex-1`}
+            />
           </div>
-          {showFieldError('ensName')}
-          {showFieldError('ensDomain')}
+          {fieldErrors.ensName && (
+            <p id={`${baseId}-ensName-error`} className="mt-1 text-[10px] text-kurio-danger">
+              {fieldErrors.ensName}
+            </p>
+          )}
+          {fieldErrors.ensDomain && (
+            <p className="mt-1 text-[10px] text-kurio-danger">{fieldErrors.ensDomain}</p>
+          )}
         </fieldset>
       </div>
       {error && (
@@ -268,33 +353,24 @@ function WalletEditor({
       )}
       <div className="mt-6 flex flex-wrap justify-end gap-2 border-t border-kurio-border pt-5">
         {onMakePrimary && (
-          <button
-            type="button"
+          <Button
+            variant="secondary"
             onClick={onMakePrimary}
             disabled={busy}
-            className="mr-auto rounded-lg border border-kurio-border px-4 py-2.5 text-xs text-kurio-text-muted hover:text-kurio-text disabled:opacity-50"
+            className="mr-auto font-normal"
           >
             Definir como principal
-          </button>
+          </Button>
         )}
         {onDelete && (
-          <button
-            type="button"
-            onClick={onDelete}
-            disabled={busy}
-            className="inline-flex items-center gap-2 rounded-lg border border-kurio-danger/50 px-4 py-2.5 text-xs text-kurio-danger disabled:opacity-50"
-          >
+          <Button variant="destructive" onClick={onDelete} disabled={busy} className="font-normal">
             <Trash2 size={14} aria-hidden="true" />
             Remover
-          </button>
+          </Button>
         )}
-        <button
-          type="submit"
-          disabled={busy}
-          className="min-h-10 rounded-lg bg-kurio-amber px-5 py-2.5 text-xs font-bold text-kurio-bg hover:bg-kurio-amber-hover focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-kurio-amber disabled:opacity-60"
-        >
-          {busy ? 'Salvando…' : wallet ? 'Salvar carteira' : 'Adicionar carteira'}
-        </button>
+        <Button type="submit" disabled={busy} className="px-5">
+          {busy ? 'Salvando…' : 'Salvar carteira'}
+        </Button>
       </div>
     </form>
   )
@@ -303,22 +379,23 @@ function WalletEditor({
 export function WalletsPage() {
   const auth = useAuth()
   const queryClient = useQueryClient()
-  const sessionKey = getSessionCacheKey() ?? 'anonymous'
+  const sessionKey = useSessionKey()
   const queryKey = ['wallets', sessionKey] as const
+  useDocumentTitle('Carteiras — KURIO')
   const walletsQuery = useQuery({
     queryKey,
     queryFn: ({ signal }) => fetchWallets(signal),
     enabled: Boolean(auth.session),
   })
-  const [addingPrimary, setAddingPrimary] = useState(false)
   const [addingSecondary, setAddingSecondary] = useState(false)
   const [pageError, setPageError] = useState('')
+  const [notice, setNotice] = useState('')
+  const [walletToDelete, setWalletToDelete] = useState<WalletDto | null>(null)
+  // Reflete o clique no checkbox imediatamente enquanto a API simulada responde.
+  const [pendingSameAsPrimary, setPendingSameAsPrimary] = useState<boolean | null>(null)
+
   const mutation = useMutation({
-    mutationFn: async (request: {
-      wallet: WalletDto | null
-      input: WalletInputDto
-      delete?: boolean
-    }): Promise<WalletsResponse> => {
+    mutationFn: async (request: WalletRequest): Promise<WalletsResponse> => {
       if (request.delete && request.wallet) {
         return deleteWallet(request.wallet.id)
       }
@@ -327,21 +404,15 @@ export function WalletsPage() {
       }
       return createWallet(request.input)
     },
-    onSuccess: (response) => {
-      queryClient.setQueryData<WalletsResponse>(queryKey, response)
+    onSuccess: ({ wallets }) => {
+      if (getSessionCacheKey() !== sessionKey) return
+      queryClient.setQueryData<WalletsResponse>(queryKey, { wallets })
       queryClient.setQueryData<AuthSessionResponseDto>(
         ['auth', 'session'],
-        (current) => (current ? { ...current, wallets: response.wallets } : current),
-      )
-      setPageError('')
-      setAddingPrimary(false)
-      setAddingSecondary(false)
-    },
-    onError: (requestError) => {
-      setPageError(
-        requestError instanceof Error
-          ? requestError.message
-          : 'Não foi possível atualizar suas carteiras.',
+        (current) =>
+          current?.session && current.session.user.id === auth.session?.user.id
+            ? { ...current, wallets }
+            : current,
       )
     },
   })
@@ -350,8 +421,9 @@ export function WalletsPage() {
     return (
       <AccountSidebarLayout active="wallets">
         <div aria-busy="true" className="space-y-4">
-          <div className="skeleton-shimmer h-8 w-56 rounded" />
-          <div className="skeleton-shimmer h-64 rounded-xl" />
+          <span className="sr-only">Carregando carteiras…</span>
+          <Skeleton className="h-8 w-56" />
+          <Skeleton className="h-64 rounded-xl" />
         </div>
       </AccountSidebarLayout>
     )
@@ -360,9 +432,7 @@ export function WalletsPage() {
     return (
       <AccountSidebarLayout active="wallets">
         <p role="alert" className="rounded-lg border border-kurio-danger/40 p-4 text-sm text-kurio-danger">
-          {walletsQuery.error instanceof Error
-            ? walletsQuery.error.message
-            : 'Não foi possível carregar suas carteiras.'}
+          {messageOf(walletsQuery.error, 'Não foi possível carregar suas carteiras.')}
         </p>
       </AccountSidebarLayout>
     )
@@ -371,139 +441,199 @@ export function WalletsPage() {
   const wallets = walletsQuery.data.wallets
   const primary = wallets.find((wallet) => wallet.isPrimary) ?? null
   const secondary = wallets.find((wallet) => !wallet.isPrimary) ?? null
-  const saveWallet = (wallet: WalletDto | null) => async (
-    input: WalletInputDto,
+  const profile = auth.session?.user
+
+  // Ações disparadas por botões da página (o erro aparece no topo, não dentro de um formulário).
+  const runAction = (
+    request: WalletRequest,
+    successMessage: string,
+    afterSuccess?: () => void,
   ) => {
-    await mutation.mutateAsync({ wallet, input })
-  }
-  const saveAsPrimary = (wallet: WalletDto | null) => async (
-    input: WalletInputDto,
-  ) => {
-    await mutation.mutateAsync({
-      wallet,
-      input: { ...input, isPrimary: true, sameAsPrimary: false },
+    setPageError('')
+    setNotice('')
+    mutation.mutate(request, {
+      onSuccess: () => {
+        setNotice(successMessage)
+        afterSuccess?.()
+      },
+      onError: (requestError) =>
+        setPageError(
+          messageOf(requestError, 'Não foi possível atualizar suas carteiras.'),
+        ),
+      onSettled: () => setPendingSameAsPrimary(null),
     })
   }
-  const profile = auth.session?.user
-  const secondaryDraft = secondary
-    ? walletToInput(secondary)
-    : emptyWallet(profile, false)
+
+  // Salvar pelo formulário: o erro é exibido dentro do próprio formulário (quem chama trata).
+  const saveFromForm =
+    (wallet: WalletDto | null) => async (input: WalletInputDto) => {
+      setPageError('')
+      setNotice('')
+      await mutation.mutateAsync({ wallet, input })
+      setNotice('Carteira salva com sucesso.')
+      setAddingSecondary(false)
+    }
 
   const setSecondarySameAsPrimary = (sameAsPrimary: boolean) => {
     if (!primary) return
+    setPendingSameAsPrimary(sameAsPrimary)
     if (secondary) {
-      mutation.mutate({
-        wallet: secondary,
-        input: {
-          ...walletToInput(secondary),
-          ...(sameAsPrimary
-            ? {
-                address: primary.address,
-                network: primary.network,
-                walletType: primary.walletType,
-                ensName: primary.ensName,
-                ensDomain: primary.ensDomain,
-              }
-            : {}),
-          sameAsPrimary,
-          isPrimary: false,
+      runAction(
+        {
+          wallet: secondary,
+          input: {
+            ...walletToInput(secondary),
+            ...(sameAsPrimary
+              ? {
+                  address: primary.address,
+                  network: primary.network,
+                  walletType: primary.walletType,
+                  ensName: primary.ensName,
+                  ensDomain: primary.ensDomain,
+                }
+              : {}),
+            sameAsPrimary,
+            isPrimary: false,
+          },
         },
-      })
+        sameAsPrimary
+          ? 'A carteira secundária agora usa o endereço da principal.'
+          : 'A carteira secundária voltou a ter um endereço próprio.',
+      )
       return
     }
     if (sameAsPrimary) {
-      mutation.mutate({
-        wallet: null,
-        input: {
-          ...walletToInput(primary),
-          isPrimary: false,
-          sameAsPrimary: true,
+      runAction(
+        {
+          wallet: null,
+          input: {
+            ...walletToInput(primary),
+            isPrimary: false,
+            sameAsPrimary: true,
+          },
         },
-      })
+        'A carteira secundária agora usa o endereço da principal.',
+      )
     } else {
+      setPendingSameAsPrimary(null)
       setAddingSecondary(true)
     }
   }
 
+  const confirmDelete = () => {
+    const target = walletToDelete
+    if (!target) return
+    setWalletToDelete(null)
+    runAction(
+      { wallet: target, input: walletToInput(target), delete: true },
+      'Carteira removida.',
+      () => {
+        document
+          .getElementById(
+            target.isPrimary ? 'wallets-primary-heading' : 'wallets-secondary-heading',
+          )
+          ?.focus()
+      },
+    )
+  }
+
+  const secondaryDraft = secondary
+    ? walletToInput(secondary)
+    : emptyWallet(profile, false)
+  const sameAsPrimaryChecked =
+    pendingSameAsPrimary ?? secondary?.sameAsPrimary ?? false
+
   return (
     <AccountSidebarLayout active="wallets">
       <div className="space-y-6">
-        <section>
-          <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
-            <div>
-              <p className="text-[10px] uppercase tracking-[0.2em] text-kurio-amber">
-                Conta
-              </p>
-              <h2 className="mt-2 text-xl font-bold">Carteira principal</h2>
-              <p className="mt-2 max-w-xl text-xs leading-5 text-kurio-text-muted">
-                Estas carteiras ficam disponíveis no pagamento e para receber NFTs comprados.
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={() => setAddingPrimary((adding) => !adding)}
-              className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-kurio-amber px-4 py-2 text-xs font-semibold text-kurio-amber hover:bg-kurio-amber/10 focus-visible:outline-2 focus-visible:outline-kurio-amber"
+        {pageError && (
+          <p role="alert" className="rounded-lg border border-kurio-danger/40 bg-kurio-danger/10 p-3 text-xs text-kurio-danger">
+            {pageError}
+          </p>
+        )}
+        {notice && (
+          <p role="status" className="rounded-lg border border-kurio-success/40 bg-kurio-success/5 p-3 text-xs text-kurio-success">
+            {notice}
+          </p>
+        )}
+        <section aria-labelledby="wallets-primary-heading">
+          <div className="mb-4">
+            <p className="text-[10px] uppercase tracking-[0.2em] text-kurio-amber">
+              Conta
+            </p>
+            <h2
+              id="wallets-primary-heading"
+              tabIndex={-1}
+              className="mt-2 text-xl font-bold focus:outline-none"
             >
-              <Plus size={15} aria-hidden="true" />
-              Adicionar
-            </button>
+              Carteira principal
+            </h2>
+            <p className="mt-2 max-w-xl text-xs leading-5 text-kurio-text-muted">
+              Estas carteiras ficam disponíveis no pagamento e para receber NFTs comprados.
+            </p>
           </div>
           {primary ? (
             <WalletEditor
               key={JSON.stringify(primary)}
-              wallet={primary}
               initialValue={walletToInput(primary)}
               busy={mutation.isPending}
-              onSave={saveWallet(primary)}
-              onDelete={() =>
-                mutation.mutate({ wallet: primary, input: walletToInput(primary), delete: true })
-              }
+              onSave={saveFromForm(primary)}
+              onDelete={() => setWalletToDelete(primary)}
             />
           ) : (
-            <div className="mb-4 flex items-center gap-3 rounded-xl border border-kurio-border bg-kurio-surface p-4">
-              <WalletCards size={20} className="text-kurio-amber" aria-hidden="true" />
-              <p className="text-xs text-kurio-text-muted">
-                Você ainda não cadastrou uma carteira principal.
-              </p>
-            </div>
-          )}
-          {addingPrimary && (
-            <div className="mt-4">
-              <h3 className="mb-3 text-sm font-bold">Adicionar carteira principal</h3>
+            <>
+              <div className="mb-4 flex items-center gap-3 rounded-xl border border-kurio-border bg-kurio-surface p-4">
+                <WalletCards size={20} className="text-kurio-amber" aria-hidden="true" />
+                <p className="text-xs text-kurio-text-muted">
+                  Você ainda não cadastrou uma carteira principal.
+                </p>
+              </div>
               <WalletEditor
                 key="new-primary"
-                wallet={null}
                 initialValue={emptyWallet(profile, true)}
                 busy={mutation.isPending}
-                onSave={saveAsPrimary(primary)}
+                onSave={saveFromForm(null)}
               />
-            </div>
+            </>
           )}
         </section>
 
-        <section className="border-t border-kurio-border pt-6">
+        <section
+          aria-labelledby="wallets-secondary-heading"
+          className="border-t border-kurio-border pt-6"
+        >
           <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
             <div>
-              <h2 className="text-lg font-bold">Carteira secundária</h2>
+              <h2
+                id="wallets-secondary-heading"
+                tabIndex={-1}
+                className="text-lg font-bold focus:outline-none"
+              >
+                Carteira secundária
+              </h2>
               <p className="mt-1 text-xs text-kurio-text-muted">
-                Adicione outra carteira de recebimento ou use a principal.
+                {secondary || addingSecondary
+                  ? 'Adicione outra carteira de recebimento ou use a principal.'
+                  : 'Você ainda não adicionou uma carteira secundária.'}
               </p>
             </div>
             {!secondary && !addingSecondary && (
-              <button
-                type="button"
+              <Button
+                variant="outline"
                 onClick={() => setAddingSecondary(true)}
-                className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-kurio-amber px-4 py-2 text-xs font-semibold text-kurio-amber hover:bg-kurio-amber/10 focus-visible:outline-2 focus-visible:outline-kurio-amber"
+                disabled={!primary}
+                aria-label="Adicionar carteira secundária"
+                className="font-semibold"
               >
                 <Plus size={15} aria-hidden="true" />
                 Adicionar
-              </button>
+              </Button>
             )}
           </div>
           <label className="mb-4 flex min-h-12 items-center gap-3 rounded-lg border border-kurio-border bg-kurio-surface px-4 py-3 text-xs text-kurio-text">
             <input
               type="checkbox"
-              checked={secondary?.sameAsPrimary ?? false}
+              checked={sameAsPrimaryChecked}
               disabled={!primary || mutation.isPending}
               onChange={(event) => setSecondarySameAsPrimary(event.target.checked)}
               className="size-4 accent-kurio-amber"
@@ -519,56 +649,77 @@ export function WalletsPage() {
               <p className="mt-1 text-xs text-kurio-text-muted">
                 {primary?.network} · {primary?.walletType}
               </p>
-              <button
-                type="button"
+              <Button
+                variant="secondary"
                 onClick={() => setSecondarySameAsPrimary(false)}
-                className="mt-4 rounded-lg border border-kurio-border px-3 py-2 text-xs text-kurio-text-muted hover:text-kurio-text"
+                disabled={mutation.isPending}
+                className="mt-4 font-normal"
               >
                 Usar endereço diferente
-              </button>
+              </Button>
             </div>
           ) : secondary ? (
             <WalletEditor
               key={JSON.stringify(secondary)}
-              wallet={secondary}
               initialValue={secondaryDraft}
               busy={mutation.isPending}
-              onSave={saveWallet(secondary)}
-              onDelete={() =>
-                mutation.mutate({
-                  wallet: secondary,
-                  input: walletToInput(secondary),
-                  delete: true,
-                })
-              }
+              onSave={saveFromForm(secondary)}
+              onDelete={() => setWalletToDelete(secondary)}
               onMakePrimary={() =>
-                mutation.mutate({
-                  wallet: secondary,
-                  input: {
-                    ...walletToInput(secondary),
-                    isPrimary: true,
-                    sameAsPrimary: false,
+                runAction(
+                  {
+                    wallet: secondary,
+                    input: {
+                      ...walletToInput(secondary),
+                      isPrimary: true,
+                      sameAsPrimary: false,
+                    },
                   },
-                })
+                  'A carteira secundária agora é a principal.',
+                )
               }
             />
           ) : addingSecondary ? (
             <WalletEditor
               key="new-secondary"
-              wallet={null}
               initialValue={secondaryDraft}
               busy={mutation.isPending}
-              onSave={saveWallet(null)}
+              onSave={saveFromForm(null)}
             />
           ) : null}
         </section>
-
-        {pageError && (
-          <p role="alert" className="rounded-lg border border-kurio-danger/40 bg-kurio-danger/10 p-3 text-xs text-kurio-danger">
-            {pageError}
-          </p>
-        )}
       </div>
+
+      <Dialog
+        open={walletToDelete !== null}
+        onClose={() => setWalletToDelete(null)}
+        labelledBy="delete-wallet-title"
+        initialFocusSelector="[data-autofocus]"
+        overlayClassName="grid place-items-center p-4"
+        className="w-full max-w-sm rounded-xl border border-kurio-border bg-kurio-surface p-6 shadow-2xl"
+      >
+        <h2 id="delete-wallet-title" className="text-lg font-bold">
+          Remover carteira?
+        </h2>
+        <p className="mt-2 text-xs leading-5 text-kurio-text-muted">
+          {walletToDelete
+            ? `A carteira ${walletToDelete.walletNickname} será removida da sua conta.${walletToDelete.isPrimary ? ' Se houver outra carteira, ela passa a ser a principal.' : ''}`
+            : ''}
+        </p>
+        <div className="mt-6 flex justify-end gap-2">
+          <Button
+            variant="secondary"
+            data-autofocus
+            onClick={() => setWalletToDelete(null)}
+            className="font-normal"
+          >
+            Cancelar
+          </Button>
+          <Button variant="destructive" onClick={confirmDelete}>
+            Remover carteira
+          </Button>
+        </div>
+      </Dialog>
     </AccountSidebarLayout>
   )
 }

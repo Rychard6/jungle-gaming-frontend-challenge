@@ -1,10 +1,23 @@
-import { toSocketIo } from '@mswjs/socket.io-binding'
-import { delay, http, HttpResponse, ws } from 'msw'
+import { delay, http, HttpResponse } from 'msw'
 import {
+  addEth,
   compareEth,
   parseEthToWei,
 } from '../shared/lib/eth-math'
-import { setMockScenario } from '../shared/api/http'
+import { getStoredMockScenario, setMockScenario } from '../shared/api/http'
+import {
+  validatePasswordChange,
+  validateCollector,
+  validatePriceRange,
+  validateProfile,
+  validateRegistration,
+  validateWallet,
+} from '../shared/lib/validation'
+import {
+  isMockScenarioId,
+  NFT_EDITION_TYPES,
+  type MockScenarioId,
+} from '../shared/api/types'
 import type {
   AddCartItemInput,
   ApplyCartCouponInput,
@@ -15,11 +28,7 @@ import type {
   CreateOrderRequestDto,
   LoginRequestDto,
   NftEditionType,
-  NftItem,
-  NftUpdatedEvent,
-  OrderDto,
   OrderStatus,
-  OrderUpdatedEvent,
   RegisterRequestDto,
   WalletProviderType,
   BlockchainNetwork,
@@ -27,6 +36,7 @@ import type {
   UpdateProfileRequestDto,
   WalletInputDto,
   UpdateCartItemInput,
+  OrderDto,
 } from '../shared/api/types'
 import {
   acknowledgeMockCartChanges,
@@ -36,6 +46,8 @@ import {
   createMockOrder,
   createMockWallet,
   deleteMockWallet,
+  getMockOrderByIdempotencyKey,
+  getMockOrderOwnerId,
   getMockProfile,
   getMockSession,
   getMockWallets,
@@ -47,6 +59,7 @@ import {
   getMockNfts,
   getMockOrder,
   getMockOrders,
+  listMockPendingOrders,
   removeMockCartCoupon,
   removeMockCartItem,
   resetMockDb,
@@ -54,30 +67,26 @@ import {
   registerMockUser,
   revokeMockSession,
   saveMockFavorites,
-  saveMockNfts,
+  updateMockNft,
   updateMockPassword,
   updateMockProfile,
   updateMockWallet,
   updateMockCartItem,
   transitionMockOrder,
 } from './db'
+import {
+  createNftUpdatedEvent,
+  dropSocketConnections,
+  emitNftUpdated,
+  emitOrderUpdated,
+  replayLastNftEvent,
+  resetSocketServerState,
+  socketIoHandler,
+} from './socket-server'
 
-// MSW normalizes Socket.IO's default path to "/" before matching WebSocket handlers.
-const socketIoLink = ws.link(/\/socket\.io\/|\/$/)
-const socketClients = new Set<
-  ReturnType<typeof toSocketIo>['client']
->()
-
-const socketIoHandler = socketIoLink.addEventListener('connection', (connection) => {
-  const socket = toSocketIo(connection)
-  socketClients.add(socket.client)
-  connection.client.addEventListener('close', () => {
-    socketClients.delete(socket.client)
-  })
-})
-
-function getScenario(request: Request): string {
-  return request.headers.get('x-mock-scenario') ?? 'default'
+function getScenario(request: Request): MockScenarioId {
+  const header = request.headers.get('x-mock-scenario')
+  return isMockScenarioId(header) ? header : 'default'
 }
 
 function splitQueryValues(params: URLSearchParams, key: string): string[] {
@@ -94,10 +103,30 @@ function parsePositiveInteger(value: string | null, fallback: number): number {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback
 }
 
+/** Busca sem diferenciar maiúsculas/minúsculas nem acentos ("musica" encontra "Música"). */
+function normalizeSearchText(value: string): string {
+  return value.normalize('NFD').replace(/\p{M}/gu, '').trim().toLocaleLowerCase()
+}
+
+function validatePriceFilter(
+  minPriceEth: string | null,
+  maxPriceEth: string | null,
+): Record<string, string> {
+  const { minPrice, maxPrice } = validatePriceRange(
+    minPriceEth ?? '',
+    maxPriceEth ?? '',
+  )
+  return {
+    ...(minPrice ? { minPriceEth: minPrice } : {}),
+    ...(maxPrice ? { maxPriceEth: maxPrice } : {}),
+  }
+}
+
 function jsonError(message: string, status: number, code: string) {
   return HttpResponse.json({ message, code }, { status })
 }
 
+// Escopo (`user:<id>` ou `guest:<id>`) usado pelo carrinho. Favoritos exigem usuário autenticado.
 function getFavoritesSessionId(request: Request): string {
   const token = getBearerToken(request)
   if (token) return `user:${getMockSession(token)?.session.user.id ?? 'invalid'}`
@@ -224,38 +253,6 @@ function toWalletInput(value: Record<string, unknown>): WalletInputDto | null {
   }
 }
 
-function validateWalletInput(input: WalletInputDto): Record<string, string> {
-  const fieldErrors: Record<string, string> = {}
-  const requiredFields: Array<[keyof WalletInputDto, string]> = [
-    ['displayName', 'Informe um nome de exibição.'],
-    ['walletNickname', 'Informe um apelido para a carteira.'],
-    ['profileName', 'Informe o nome do perfil.'],
-    ['address', 'Informe o endereço da carteira.'],
-    ['referralCode', 'Informe o código de indicação.'],
-    ['ensName', 'Informe seu nome ENS.'],
-  ]
-  for (const [field, message] of requiredFields) {
-    if (!input[field]?.toString().trim()) fieldErrors[field] = message
-  }
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input.email)) {
-    fieldErrors.email = 'Informe um e-mail válido.'
-  }
-  if (!/^0x(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{4}\.\.\.[a-fA-F0-9]{4})$/.test(input.address)) {
-    fieldErrors.address = 'Informe um endereço 0x válido.'
-  }
-  if (!['.eth', '.kurio', '.xyz'].includes(input.ensDomain)) {
-    fieldErrors.ensDomain = 'Selecione um domínio ENS válido.'
-  }
-  if (
-    input.secondaryAddressOrEns &&
-    !input.secondaryAddressOrEns.includes('.') &&
-    !/^0x[a-fA-F0-9]{4,}$/.test(input.secondaryAddressOrEns)
-  ) {
-    fieldErrors.secondaryAddressOrEns = 'Informe um ENS ou endereço válido.'
-  }
-  return fieldErrors
-}
-
 function isBlockchainNetwork(value: unknown): value is BlockchainNetwork {
   return value === 'Ethereum' || value === 'Polygon' || value === 'Solana'
 }
@@ -325,47 +322,53 @@ function parseCreateOrderInput(value: unknown): CreateOrderRequestDto | null {
   }
 }
 
-function createOrderUpdatedEvent(order: OrderDto): OrderUpdatedEvent {
-  return {
-    eventId: crypto.randomUUID(),
-    type: 'order.updated',
-    resourceId: order.id,
-    version: order.version,
-    userId: order.userId,
-    timestamp: order.updatedAt,
-    payload: {
-      orderId: order.id,
-      status: order.status,
-      transactionHash: order.transactionHash,
-      ...(order.failureReason ? { failureReason: order.failureReason } : {}),
-    },
+const ORDER_CONFIRMATION_DELAY_MS = 1200
+
+const scheduledOrderTransitions = new Map<string, ReturnType<typeof setTimeout>>()
+
+function emitOrderStockUpdates(order: OrderDto): void {
+  for (const item of order.snapshot.items) {
+    const nft = getMockNfts().find((entry) => entry.id === item.nftId)
+    if (nft) emitNftUpdated(createNftUpdatedEvent(nft))
   }
 }
 
-function emitOrderUpdated(order: OrderDto): void {
-  const event = createOrderUpdatedEvent(order)
-  for (const client of socketClients) {
-    client.emit('order.updated', event)
-  }
-}
-
-const scheduledOrderTransitions = new Set<string>()
-function scheduleOrderConfirmation(order: OrderDto): void {
-  if (order.status !== 'pending' || scheduledOrderTransitions.has(order.id)) {
+// Sob `order-pending` o pedido só avança quando alguém o confirma ou recusa
+// (toolbar ou `/__mock__/simulate-order-update`), o que permite testar o estado pendente.
+function scheduleOrderConfirmation(
+  order: OrderDto,
+  scenario: MockScenarioId,
+): void {
+  if (
+    scenario === 'order-pending' ||
+    order.status !== 'pending' ||
+    scheduledOrderTransitions.has(order.id)
+  ) {
     return
   }
-  scheduledOrderTransitions.add(order.id)
-  setTimeout(() => {
+  const timer = setTimeout(() => {
     const confirmed = transitionMockOrder(order.userId, order.id, 'confirmed')
     if (confirmed) emitOrderUpdated(confirmed)
     scheduledOrderTransitions.delete(order.id)
-  }, 1200)
+  }, ORDER_CONFIRMATION_DELAY_MS)
+  scheduledOrderTransitions.set(order.id, timer)
+}
+
+// Os timers vivem na página: ao recarregar, pedidos pendentes retomam a simulação.
+function resumePendingOrders(): void {
+  const scenario = getStoredMockScenario()
+  for (const order of listMockPendingOrders()) {
+    scheduleOrderConfirmation(order, scenario)
+  }
 }
 
 const timeoutRecoveryKeys = new Set<string>()
+// Mudanças "durante a compra" disparam uma única vez por usuário e cenário,
+// senão o usuário ficaria preso em um ciclo infinito de revisão.
+const duringPurchaseChanges = new Set<string>()
 
 function isEditionType(value: unknown): value is NftEditionType {
-  return value === '1/1' || value === '1/10' || value === '1/50' || value === 'ABERTA'
+  return NFT_EDITION_TYPES.some((edition) => edition === value)
 }
 
 function cartMutationError(error: unknown) {
@@ -381,6 +384,9 @@ function cartMutationError(error: unknown) {
   }
   if (error.message === 'CART_ITEM_NOT_FOUND') {
     return jsonError('Item não encontrado no carrinho.', 404, 'CART_ITEM_NOT_FOUND')
+  }
+  if (error.message === 'EDITION_UNAVAILABLE') {
+    return jsonError('Esta edição não está disponível para o NFT.', 409, 'EDITION_UNAVAILABLE')
   }
   if (error.message === 'COUPON_EXPIRED') {
     return jsonError('Este código promocional expirou.', 422, 'COUPON_EXPIRED')
@@ -402,10 +408,89 @@ function cartMutationError(error: unknown) {
 }
 
 let outOfOrderRequestCount = 0
+let slowNetworkRequestCount = 0
 let sessionExpiredScenarioTriggered = false
+
+// Sequência fixa e irregular: a lentidão varia entre requisições, mas os testes continuam reproduzíveis.
+const SLOW_NETWORK_DELAYS_MS = [900, 1500, 400, 1200, 700] as const
+
+/** Restaura os contadores e disparos únicos dos cenários para um estado conhecido. */
+function resetScenarioState(): void {
+  outOfOrderRequestCount = 0
+  slowNetworkRequestCount = 0
+  sessionExpiredScenarioTriggered = false
+  timeoutRecoveryKeys.clear()
+  duringPurchaseChanges.clear()
+  for (const timer of scheduledOrderTransitions.values()) clearTimeout(timer)
+  scheduledOrderTransitions.clear()
+  resetSocketServerState()
+}
+
+/**
+ * Cenários `price-change-on-checkout` e `edition-sold-out`: na primeira tentativa de
+ * compra o catálogo muda (REST + evento `nft.updated`) e o pedido é recusado com 409,
+ * obrigando o usuário a revisar a nova cotação.
+ */
+function applyDuringPurchaseScenario(
+  userId: string,
+  scenario: MockScenarioId,
+): Response | null {
+  if (scenario !== 'price-change-on-checkout' && scenario !== 'edition-sold-out') {
+    return null
+  }
+  const triggerKey = `${userId}:${scenario}`
+  if (duringPurchaseChanges.has(triggerKey)) return null
+  const [firstItem] = getMockCheckoutQuote(userId).items
+  if (!firstItem) return null
+  duringPurchaseChanges.add(triggerKey)
+
+  if (scenario === 'price-change-on-checkout') {
+    const updated = updateMockNft(firstItem.nftId, {
+      priceEth: addEth(firstItem.unitPriceEth, '0.05'),
+    })
+    if (updated) emitNftUpdated(createNftUpdatedEvent(updated))
+    return jsonError(
+      `O preço de ${firstItem.title} mudou durante a compra. Revise os novos valores antes de confirmar.`,
+      409,
+      'STALE_QUOTE',
+    )
+  }
+  const updated = updateMockNft(firstItem.nftId, { availableEditions: 0 })
+  if (updated) emitNftUpdated(createNftUpdatedEvent(updated))
+  return jsonError(
+    `A edição de ${firstItem.title} esgotou durante a compra. Revise o carrinho.`,
+    409,
+    'EDITION_SOLD_OUT',
+  )
+}
+
+const SCENARIO_GATE_EXEMPT_PATHS = /^\/api\/(__mock__|auth)\//
+
+// Avatar enviado pelo usuário é reduzido no cliente e trafega como data URL (≤ 300.000 caracteres).
+const AVATAR_DATA_URL_PATTERN = /^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}$/
+const AVATAR_DATA_URL_MAX_LENGTH = 300_000
+
+/**
+ * Primeiro handler: aplica lentidão (`slow-network`) e falha 5xx (`server-error-500`) a toda a
+ * API de dados. Retornar `undefined` faz o MSW seguir para o handler específico da rota.
+ */
+const scenarioGateHandler = http.all('/api/*', async ({ request }) => {
+  if (SCENARIO_GATE_EXEMPT_PATHS.test(new URL(request.url).pathname)) return
+  const scenario = getScenario(request)
+  if (scenario === 'slow-network') {
+    const delayMs =
+      SLOW_NETWORK_DELAYS_MS[slowNetworkRequestCount % SLOW_NETWORK_DELAYS_MS.length]
+    slowNetworkRequestCount += 1
+    await delay(delayMs)
+  }
+  if (scenario === 'server-error-500') {
+    return jsonError('Falha simulada no servidor.', 500, 'MOCK_SERVER_ERROR')
+  }
+})
 
 export const handlers = [
   socketIoHandler,
+  scenarioGateHandler,
   http.post('/api/checkout/quote', ({ request }) => {
     const auth = requireAuthenticatedUser(request)
     if (auth.response) return auth.response
@@ -432,7 +517,28 @@ export const handlers = [
     if (!input) {
       return jsonError('Dados inválidos para criar o pedido.', 400, 'INVALID_ORDER_INPUT')
     }
+    const fieldErrors = validateCollector(input.collector)
+    if (input.network !== input.collector.network) fieldErrors.network = 'A rede deve corresponder à carteira selecionada.'
+    if (input.walletProvider !== input.collector.walletType) fieldErrors.walletType = 'O provedor deve corresponder à carteira selecionada.'
+    if (Object.keys(fieldErrors).length > 0) {
+      return HttpResponse.json(
+        { message: 'Revise os campos indicados.', code: 'VALIDATION_ERROR', fieldErrors },
+        { status: 422 },
+      )
+    }
     const scenario = getScenario(request)
+    const alreadyCreated = getMockOrderByIdempotencyKey(auth.userId, idempotencyKey)
+    if (!alreadyCreated) {
+      const pendingOrder = getMockOrders(auth.userId).find((order) => order.status === 'pending')
+      if (pendingOrder) {
+        return jsonError('Você já tem uma compra em processamento. Aguarde sua conclusão.', 409, 'ORDER_PENDING')
+      }
+      const changedDuringPurchase = applyDuringPurchaseScenario(
+        auth.userId,
+        scenario,
+      )
+      if (changedDuringPurchase) return changedDuringPurchase
+    }
     const status: OrderStatus =
       scenario === 'payment-declined' ? 'declined' : 'pending'
     const result = createMockOrder(
@@ -455,14 +561,20 @@ export const handlers = [
         'STALE_QUOTE',
       )
     }
+    if (result.kind === 'unavailable') {
+      return jsonError(result.message, 409, 'EDITION_SOLD_OUT')
+    }
     if (result.kind === 'invalid-cart') {
       return jsonError(result.message, 409, 'CART_NOT_PURCHASABLE')
     }
 
+    if (result.kind === 'created' && result.order.status !== 'declined') {
+      emitOrderStockUpdates(result.order)
+    }
     if (result.order.status === 'declined') {
       if (result.kind === 'created') emitOrderUpdated(result.order)
     } else {
-      scheduleOrderConfirmation(result.order)
+      scheduleOrderConfirmation(result.order, scenario)
     }
 
     if (
@@ -491,7 +603,17 @@ export const handlers = [
     const auth = requireAuthenticatedUser(request)
     if (auth.response) return auth.response
     const order = getMockOrder(auth.userId, String(params.orderId))
-    if (!order) return jsonError('Pedido não encontrado.', 404, 'ORDER_NOT_FOUND')
+    if (!order) {
+      const ownerId = getMockOrderOwnerId(String(params.orderId))
+      if (ownerId && ownerId !== auth.userId) {
+        return jsonError(
+          'Você não tem permissão para acessar este pedido.',
+          403,
+          'ORDER_FORBIDDEN',
+        )
+      }
+      return jsonError('Pedido não encontrado.', 404, 'ORDER_NOT_FOUND')
+    }
     return HttpResponse.json({ order })
   }),
   http.post('/api/__mock__/simulate-order-update', async ({ request }) => {
@@ -516,6 +638,7 @@ export const handlers = [
     if (!updatedOrder) {
       return jsonError('Somente pedidos pendentes podem ser atualizados.', 409, 'ORDER_NOT_PENDING')
     }
+    if (updatedOrder.status === 'declined') emitOrderStockUpdates(updatedOrder)
     emitOrderUpdated(updatedOrder)
     return HttpResponse.json({ order: updatedOrder })
   }),
@@ -547,29 +670,17 @@ export const handlers = [
           ? body.avatarUrl
           : null,
     }
-    const fieldErrors: Record<string, string> = {}
-    if (input.displayName.length < 2) {
-      fieldErrors.displayName = 'Informe um nome de exibição com pelo menos 2 caracteres.'
-    }
-    if (input.username.length < 3) {
-      fieldErrors.username = 'O nome de usuário deve ter pelo menos 3 caracteres.'
-    }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input.email)) {
-      fieldErrors.email = 'Informe um e-mail válido.'
-    }
-    if (!input.ensName) fieldErrors.ensName = 'Informe seu nome ENS.'
-    if (!['.eth', '.kurio', '.xyz'].includes(input.ensDomain)) {
-      fieldErrors.ensDomain = 'Selecione um domínio ENS válido.'
-    }
-    if (input.walletNickname.length < 2) {
-      fieldErrors.walletNickname = 'Informe um apelido de carteira.'
-    }
-    if (
-      typeof input.avatarUrl === 'string' &&
-      !input.avatarUrl.startsWith('/mock-assets/nfts/') &&
-      !/^https?:\/\/\S+$/i.test(input.avatarUrl)
-    ) {
-      fieldErrors.avatarUrl = 'Informe uma URL http(s) válida para o avatar.'
+    const fieldErrors: Record<string, string> = validateProfile(input)
+    if (typeof input.avatarUrl === 'string') {
+      const isPresetAvatar = input.avatarUrl.startsWith('/mock-assets/nfts/')
+      const isUploadedAvatar =
+        input.avatarUrl.length <= AVATAR_DATA_URL_MAX_LENGTH &&
+        AVATAR_DATA_URL_PATTERN.test(input.avatarUrl)
+      const isRemoteAvatar = /^https?:\/\/\S+$/i.test(input.avatarUrl)
+      if (!isPresetAvatar && !isUploadedAvatar && !isRemoteAvatar) {
+        fieldErrors.avatarUrl =
+          'Envie uma imagem PNG, JPEG ou WebP de até 200 KB, ou escolha uma das artes KURIO.'
+      }
     }
     if (Object.keys(fieldErrors).length > 0) {
       return HttpResponse.json(
@@ -622,13 +733,7 @@ export const handlers = [
       newPassword: body.newPassword,
       confirmPassword: body.confirmPassword,
     }
-    const fieldErrors: Record<string, string> = {}
-    if (input.newPassword.length < 8) {
-      fieldErrors.newPassword = 'A nova senha deve ter pelo menos 8 caracteres.'
-    }
-    if (input.newPassword !== input.confirmPassword) {
-      fieldErrors.confirmPassword = 'As senhas não coincidem.'
-    }
+    const fieldErrors = validatePasswordChange(input)
     if (Object.keys(fieldErrors).length > 0) {
       return HttpResponse.json(
         { message: 'Revise os campos indicados.', code: 'VALIDATION_ERROR', fieldErrors },
@@ -636,11 +741,11 @@ export const handlers = [
       )
     }
     if (
-      !updateMockPassword(
+      !(await updateMockPassword(
         auth.userId,
         input.currentPassword,
         input.newPassword,
-      )
+      ))
     ) {
       return HttpResponse.json(
         {
@@ -669,7 +774,7 @@ export const handlers = [
     if (!input) {
       return jsonError('Informe os dados obrigatórios da carteira.', 400, 'INVALID_WALLET_INPUT')
     }
-    const fieldErrors = validateWalletInput(input)
+    const fieldErrors = validateWallet(input)
     if (Object.keys(fieldErrors).length > 0) {
       return HttpResponse.json(
         { message: 'Revise os campos indicados.', code: 'VALIDATION_ERROR', fieldErrors },
@@ -691,7 +796,7 @@ export const handlers = [
     if (!input) {
       return jsonError('Informe os dados obrigatórios da carteira.', 400, 'INVALID_WALLET_INPUT')
     }
-    const fieldErrors = validateWalletInput(input)
+    const fieldErrors = validateWallet(input)
     if (Object.keys(fieldErrors).length > 0) {
       return HttpResponse.json(
         { message: 'Revise os campos indicados.', code: 'VALIDATION_ERROR', fieldErrors },
@@ -723,7 +828,7 @@ export const handlers = [
       email: body.email,
       password: body.password,
     }
-    const result = authenticateMockUser(input.email, input.password)
+    const result = await authenticateMockUser(input.email, input.password)
     if (!result) {
       return jsonError(
         'E-mail ou senha inválidos.',
@@ -751,19 +856,7 @@ export const handlers = [
       password: body.password,
       confirmPassword: body.confirmPassword,
     }
-    const fieldErrors: Record<string, string> = {}
-    if (input.username.length < 3) {
-      fieldErrors.username = 'O nome de usuário deve ter pelo menos 3 caracteres.'
-    }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input.email)) {
-      fieldErrors.email = 'Informe um e-mail válido.'
-    }
-    if (input.password.length < 8) {
-      fieldErrors.password = 'A senha deve ter pelo menos 8 caracteres.'
-    }
-    if (input.password !== input.confirmPassword) {
-      fieldErrors.confirmPassword = 'As senhas não coincidem.'
-    }
+    const fieldErrors = validateRegistration(input)
     if (Object.keys(fieldErrors).length > 0) {
       return HttpResponse.json(
         { message: 'Revise os campos indicados.', code: 'VALIDATION_ERROR', fieldErrors },
@@ -788,7 +881,7 @@ export const handlers = [
         { status: 409 },
       )
     }
-    const result = registerMockUser({
+    const result = await registerMockUser({
       username: input.username,
       email: input.email,
       password: input.password,
@@ -818,19 +911,15 @@ export const handlers = [
   }),
   http.get('/api/nfts', async ({ request }) => {
     const scenario = getScenario(request)
-    if (scenario === 'slow-network') await delay(900)
     if (scenario === 'out-of-order') {
       outOfOrderRequestCount += 1
       await delay(outOfOrderRequestCount === 1 ? 1600 : 150)
     } else {
       outOfOrderRequestCount = 0
     }
-    if (scenario === 'server-error-500') {
-      return jsonError('Falha simulada no servidor.', 500, 'MOCK_SERVER_ERROR')
-    }
 
     const url = new URL(request.url)
-    const search = url.searchParams.get('search')?.trim().toLocaleLowerCase()
+    const search = normalizeSearchText(url.searchParams.get('search') ?? '')
     const categories = splitQueryValues(url.searchParams, 'categories')
     const networks = splitQueryValues(url.searchParams, 'networks')
     const minPriceEth = url.searchParams.get('minPriceEth')
@@ -842,13 +931,26 @@ export const handlers = [
       parsePositiveInteger(url.searchParams.get('limit'), 12),
       100,
     )
+    const featuredOnly = url.searchParams.get('featured') === 'true'
+
+    const priceErrors = validatePriceFilter(minPriceEth, maxPriceEth)
+    if (Object.keys(priceErrors).length > 0) {
+      return HttpResponse.json(
+        {
+          message: 'Revise o filtro de preço.',
+          code: 'VALIDATION_ERROR',
+          fieldErrors: priceErrors,
+        },
+        { status: 422 },
+      )
+    }
 
     let items = getMockNfts().filter((nft) => {
       if (
         search &&
-        !`${nft.title} ${nft.collectionName} ${nft.description} ${nft.tokenId}`
-          .toLocaleLowerCase()
-          .includes(search)
+        !normalizeSearchText(
+          `${nft.title} ${nft.collectionName} ${nft.description} ${nft.tokenId}`,
+        ).includes(search)
       ) {
         return false
       }
@@ -872,8 +974,10 @@ export const handlers = [
       }
       if (tab === 'new' && !nft.isLaunch) return false
       if (tab === 'trending' && nft.rating < 4.7) return false
+      if (featuredOnly && !nft.isFeatured) return false
       return true
     })
+    if (scenario === 'empty-results') items = []
 
     switch (sort) {
       case 'price_asc':
@@ -919,32 +1023,32 @@ export const handlers = [
     return HttpResponse.json(nft)
   }),
   http.get('/api/favorites', ({ request }) => {
-    const sessionError = getSessionError(request)
-    if (sessionError) return sessionError
+    const auth = requireAuthenticatedUser(request)
+    if (auth.response) return auth.response
     if (isNetworkErrorScenario(request)) return HttpResponse.error()
     return HttpResponse.json({
-      nftIds: getMockFavorites(getFavoritesSessionId(request)),
+      nftIds: getMockFavorites(`user:${auth.userId}`),
     })
   }),
   http.post('/api/favorites/:nftId', ({ params, request }) => {
-    const sessionError = getSessionError(request)
-    if (sessionError) return sessionError
+    const auth = requireAuthenticatedUser(request)
+    if (auth.response) return auth.response
     if (isNetworkErrorScenario(request)) return HttpResponse.error()
     const nftId = String(params.nftId)
     if (!getMockNfts().some((item) => item.id === nftId)) {
       return jsonError('NFT não encontrado.', 404, 'NFT_NOT_FOUND')
     }
-    const sessionId = getFavoritesSessionId(request)
+    const sessionId = `user:${auth.userId}`
     const favorites = getMockFavorites(sessionId)
     return HttpResponse.json({
       nftIds: saveMockFavorites(sessionId, [...favorites, nftId]),
     })
   }),
   http.delete('/api/favorites/:nftId', ({ params, request }) => {
-    const sessionError = getSessionError(request)
-    if (sessionError) return sessionError
+    const auth = requireAuthenticatedUser(request)
+    if (auth.response) return auth.response
     if (isNetworkErrorScenario(request)) return HttpResponse.error()
-    const sessionId = getFavoritesSessionId(request)
+    const sessionId = `user:${auth.userId}`
     const nftId = String(params.nftId)
     return HttpResponse.json({
       nftIds: saveMockFavorites(
@@ -1068,18 +1172,16 @@ export const handlers = [
   }),
   http.post('/api/__mock__/reset', () => {
     const items = resetMockDb()
+    resetScenarioState()
     setMockScenario('default')
     return HttpResponse.json({ items, scenario: 'default' })
   }),
   http.post('/api/__mock__/simulate-nft-update', async ({ request }) => {
-    const body: unknown = await request.json()
+    const body: unknown = await request.json().catch(() => null)
     if (
       !isRecord(body) ||
-      !('nftId' in body) ||
       typeof body.nftId !== 'string' ||
-      !('priceEth' in body) ||
       typeof body.priceEth !== 'string' ||
-      !('availableEditions' in body) ||
       typeof body.availableEditions !== 'number' ||
       !Number.isSafeInteger(body.availableEditions) ||
       body.availableEditions < 0
@@ -1093,40 +1195,31 @@ export const handlers = [
       return jsonError('Preço ETH inválido.', 400, 'INVALID_ETH_PRICE')
     }
 
-    const items = getMockNfts()
-    const nft = items.find((item) => item.id === body.nftId)
-    if (!nft) {
+    const updatedNft = updateMockNft(body.nftId, {
+      priceEth: body.priceEth,
+      availableEditions: body.availableEditions,
+    })
+    if (!updatedNft) {
       return jsonError('NFT não encontrado.', 404, 'NFT_NOT_FOUND')
     }
 
-    const updatedNft: NftItem = {
-      ...nft,
-      priceEth: body.priceEth,
-      availableEditions: body.availableEditions,
-      version: nft.version + 1,
-      updatedAt: new Date().toISOString(),
-    }
-    saveMockNfts(
-      items.map((item) => (item.id === nft.id ? updatedNft : item)),
-    )
-
-    const event: NftUpdatedEvent = {
-      eventId: crypto.randomUUID(),
-      type: 'nft.updated',
-      resourceId: nft.id,
-      version: updatedNft.version,
-      timestamp: updatedNft.updatedAt,
-      payload: {
-        nftId: nft.id,
-        priceEth: updatedNft.priceEth,
-        availableEditions: updatedNft.availableEditions,
-        editionType: updatedNft.editionType,
-      },
-    }
-    for (const client of socketClients) {
-      client.emit('nft.updated', event)
-    }
-
+    const event = createNftUpdatedEvent(updatedNft)
+    emitNftUpdated(event)
     return HttpResponse.json(event)
   }),
+  http.post('/api/__mock__/simulate-duplicate-events', () => {
+    if (!replayLastNftEvent()) {
+      return jsonError(
+        'Dispare um evento nft.updated antes de testar duplicatas.',
+        409,
+        'NO_EVENT_TO_REPLAY',
+      )
+    }
+    return HttpResponse.json({ replayed: 2 })
+  }),
+  http.post('/api/__mock__/simulate-socket-drop', () =>
+    HttpResponse.json({ closedConnections: dropSocketConnections() }),
+  ),
 ]
+
+resumePendingOrders()

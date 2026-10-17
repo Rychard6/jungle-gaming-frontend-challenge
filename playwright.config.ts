@@ -11,13 +11,14 @@ export default defineConfig({
   workers: process.env.CI ? 1 : undefined,
   reporter: [
     ['list'],
-    ['html', { open: 'never' }],
+    ['html', { open: 'never', outputFolder: 'reports/playwright' }],
   ],
   use: {
     baseURL,
+    channel: process.env.PLAYWRIGHT_CHANNEL || undefined,
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
-    video: 'retain-on-failure',
+    video: process.env.PLAYWRIGHT_VIDEO === 'off' ? 'off' : 'retain-on-failure',
     actionTimeout: 10_000,
   },
   projects: [
@@ -37,6 +38,13 @@ export default defineConfig({
         deviceScaleFactor: 1,
         isMobile: true,
         hasTouch: true,
+      },
+    },
+    {
+      name: 'tablet-chromium',
+      use: {
+        ...devices['Desktop Chrome'],
+        viewport: { width: 768, height: 1024 },
       },
     },
   ],

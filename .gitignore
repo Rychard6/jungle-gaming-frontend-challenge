@@ -11,8 +11,19 @@ node_modules
 dist
 dist-ssr
 *.local
-playwright-report
-test-results
+.env
+.env.*
+!.env.example
+
+# Artefatos gerados por testes e auditorias
+test-results/
+playwright-report/
+lighthouse-report/
+.lighthouseci/
+*lighthouse.*/
+
+# Arquivos de marcação de DLP criados pelo ambiente corporativo (ex.: package.json:sec.endpointdlp)
+*:sec.endpointdlp
 
 # Editor directories and files
 .vscode/*

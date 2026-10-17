@@ -1,96 +1,98 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react'
-import { Link, useNavigate, useSearch } from '@tanstack/react-router'
+import { useRef, useState, type FormEvent } from 'react'
+import { Link, useNavigate, useRouter, useSearch } from '@tanstack/react-router'
 import { Eye, EyeOff, X } from 'lucide-react'
 import { ApiClientError } from '../../../shared/api/http'
 import type { RegisterRequestDto } from '../../../shared/api/types'
+import {
+  validateLogin,
+  validateRegistration,
+  type FieldErrors,
+} from '../../../shared/lib/validation'
+import { useDocumentTitle } from '../../../shared/lib/use-document-title'
+import { Button } from '../../../shared/ui/button'
+import { Dialog } from '../../../shared/ui/dialog'
+import { Input } from '../../../shared/ui/input'
+import { Label } from '../../../shared/ui/label'
 import { useAuth } from '../hooks/auth-context'
+import { safeRedirectPath } from '../lib/safe-redirect'
 
 type AuthMode = 'login' | 'register'
 
-function safeRedirectPath(value: string | undefined): string | null {
-  if (!value || !value.startsWith('/') || value.startsWith('//')) return null
-  return value
+const HOME_SEARCH = { tab: 'all', sort: 'recent', page: 1 } as const
+
+function field(formData: FormData, name: string): string {
+  return String(formData.get(name) ?? '')
 }
 
 export function AuthModalOrPage({ mode }: { mode: AuthMode }) {
   const navigate = useNavigate()
-  const search = useSearch({ strict: false }) as {
-    redirect?: string
-    expired?: boolean
-  }
+  const router = useRouter()
+  const { redirect, expired } = useSearch({ strict: false })
   const { login, register, notice, clearNotice } = useAuth()
   const [showPassword, setShowPassword] = useState(false)
   const [formError, setFormError] = useState('')
-  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({})
+  const [info, setInfo] = useState('')
+  const [fieldErrors, setFieldErrors] = useState<FieldErrors>({})
   const [submitting, setSubmitting] = useState(false)
-  const dialogRef = useRef<HTMLElement>(null)
+  const formRef = useRef<HTMLFormElement>(null)
   const isRegister = mode === 'register'
-  const redirectPath = safeRedirectPath(search.redirect)
+  const redirectPath = safeRedirectPath(redirect)
+  useDocumentTitle(isRegister ? 'Criar conta — KURIO' : 'Entrar — KURIO')
 
-  useEffect(() => {
-    dialogRef.current
-      ?.querySelector<HTMLElement>('input')
-      ?.focus()
-
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        void navigate({
-          to: '/',
-          search: { tab: 'all', sort: 'recent', page: 1 },
-        })
-        return
-      }
-      if (event.key !== 'Tab') return
-
-      const dialog = dialogRef.current
-      const focusable = dialog?.querySelectorAll<HTMLElement>(
-        'a[href], button:not([disabled]), input:not([disabled])',
-      )
-      if (!focusable?.length) return
-
-      const first = focusable[0]
-      const last = focusable[focusable.length - 1]
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault()
-        last.focus()
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault()
-        first.focus()
-      }
+  // Volta para onde o usuário estava (ex.: carrinho); sem histórico interno, vai ao catálogo.
+  const closeAuth = () => {
+    if (router.history.canGoBack()) {
+      router.history.back()
+      return
     }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [navigate])
+    void navigate({ to: '/', search: HOME_SEARCH })
+  }
 
   const finishAuthentication = () => {
     clearNotice()
     if (redirectPath) {
-      window.location.assign(redirectPath)
+      router.history.push(redirectPath)
       return
     }
-    void navigate({
-      to: '/',
-      search: { tab: 'all', sort: 'recent', page: 1 },
-    })
+    void navigate({ to: '/', search: HOME_SEARCH })
+  }
+
+  const focusFirstInvalidField = (errors: FieldErrors) => {
+    const firstInvalid = ['username', 'email', 'password', 'confirmPassword']
+      .find((name) => errors[name])
+    if (!firstInvalid) return
+    formRef.current
+      ?.querySelector<HTMLElement>(`[name="${firstInvalid}"]`)
+      ?.focus()
   }
 
   const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     setFormError('')
-    setFieldErrors({})
-    setSubmitting(true)
+    setInfo('')
     const formData = new FormData(event.currentTarget)
-    const email = String(formData.get('email') ?? '').trim()
-    const password = String(formData.get('password') ?? '')
+    const email = field(formData, 'email').trim()
+    const password = field(formData, 'password')
+    const registration: RegisterRequestDto = {
+      username: field(formData, 'username').trim(),
+      email,
+      password,
+      confirmPassword: field(formData, 'confirmPassword'),
+    }
+
+    const clientErrors = isRegister
+      ? validateRegistration(registration)
+      : validateLogin({ email, password })
+    setFieldErrors(clientErrors)
+    if (Object.keys(clientErrors).length > 0) {
+      focusFirstInvalidField(clientErrors)
+      return
+    }
+
+    setSubmitting(true)
     try {
       if (isRegister) {
-        const input: RegisterRequestDto = {
-          username: String(formData.get('username') ?? '').trim(),
-          email,
-          password,
-          confirmPassword: String(formData.get('confirmPassword') ?? ''),
-        }
-        await register(input)
+        await register(registration)
       } else {
         await login({ email, password })
       }
@@ -99,6 +101,7 @@ export function AuthModalOrPage({ mode }: { mode: AuthMode }) {
       if (error instanceof ApiClientError) {
         setFormError(error.message)
         setFieldErrors(error.fieldErrors ?? {})
+        focusFirstInvalidField(error.fieldErrors ?? {})
       } else {
         setFormError(
           error instanceof Error
@@ -111,26 +114,30 @@ export function AuthModalOrPage({ mode }: { mode: AuthMode }) {
     }
   }
 
-  const inputClass =
-    'mt-1.5 h-11 w-full rounded-lg border border-kurio-border bg-kurio-bg px-3 text-sm text-kurio-text placeholder:text-kurio-text-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-kurio-amber'
+  const errorId = (name: string) => `auth-${name}-error`
+  const describe = (name: string) =>
+    fieldErrors[name] ? errorId(name) : undefined
+  const renderFieldError = (name: string) =>
+    fieldErrors[name] ? (
+      <p id={errorId(name)} className="mt-1 text-xs text-kurio-danger">
+        {fieldErrors[name]}
+      </p>
+    ) : null
 
   return (
-    <main className="fixed inset-0 z-[60] grid overflow-y-auto bg-black/75 p-0 backdrop-blur-sm md:place-items-center md:p-6">
-      <section
-        ref={dialogRef}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="auth-title"
+    <main>
+      <Dialog
+        open
+        onClose={closeAuth}
+        labelledBy="auth-title"
+        initialFocusSelector="input"
+        closeOnBackdropClick={false}
+        overlayClassName="grid overflow-y-auto bg-black/75 p-0 backdrop-blur-sm md:place-items-center md:p-6"
         className="relative my-auto min-h-screen w-full border border-kurio-border bg-kurio-surface px-6 py-10 text-kurio-text md:min-h-0 md:max-w-md md:rounded-2xl md:px-9 md:py-8"
       >
         <button
           type="button"
-          onClick={() =>
-            void navigate({
-              to: '/',
-              search: { tab: 'all', sort: 'recent', page: 1 },
-            })
-          }
+          onClick={closeAuth}
           aria-label="Fechar autenticação"
           className="absolute right-5 top-5 grid size-9 place-items-center rounded-full border border-kurio-border text-kurio-text-muted hover:text-kurio-text focus-visible:outline-2 focus-visible:outline-kurio-amber"
         >
@@ -142,23 +149,25 @@ export function AuthModalOrPage({ mode }: { mode: AuthMode }) {
         <div className="mt-7 grid grid-cols-2 border-b border-kurio-border text-center text-sm">
           <Link
             to="/login"
+            replace
             search={(previous) => ({
               redirect: previous.redirect,
               expired: previous.expired,
             })}
             aria-current={!isRegister ? 'page' : undefined}
-            className={`border-b-2 pb-3 ${!isRegister ? 'border-kurio-amber font-bold text-kurio-amber' : 'border-transparent text-kurio-text-muted'}`}
+            className={`border-b-2 pb-3 focus-visible:outline-2 focus-visible:outline-kurio-amber ${!isRegister ? 'border-kurio-amber font-bold text-kurio-amber' : 'border-transparent text-kurio-text-muted'}`}
           >
             Entrar
           </Link>
           <Link
             to="/register"
+            replace
             search={(previous) => ({
               redirect: previous.redirect,
               expired: previous.expired,
             })}
             aria-current={isRegister ? 'page' : undefined}
-            className={`border-b-2 pb-3 ${isRegister ? 'border-kurio-amber font-bold text-kurio-amber' : 'border-transparent text-kurio-text-muted'}`}
+            className={`border-b-2 pb-3 focus-visible:outline-2 focus-visible:outline-kurio-amber ${isRegister ? 'border-kurio-amber font-bold text-kurio-amber' : 'border-transparent text-kurio-text-muted'}`}
           >
             Criar conta
           </Link>
@@ -168,110 +177,98 @@ export function AuthModalOrPage({ mode }: { mode: AuthMode }) {
         </h1>
         <p className="mt-2 text-center text-xs text-kurio-text-muted">
           {isRegister
-            ? 'Faça parte da comunidade de colecionadores KURIO.'
-            : 'Entre para continuar sua jornada de colecionador.'}
+            ? 'Crie seu perfil de colecionador e conecte uma carteira quando quiser.'
+            : 'Entre para gerenciar sua carteira, coleção e perfil de criador.'}
         </p>
-        {(notice || (search.expired && !notice)) && (
+        {(notice || expired) && (
           <p role="alert" className="mt-5 rounded-lg border border-kurio-amber/40 bg-kurio-amber/10 p-3 text-xs text-kurio-amber">
             {notice || 'Sua sessão expirou. Faça login novamente para continuar.'}
           </p>
         )}
-        <form onSubmit={(event) => void onSubmit(event)} className="mt-6 space-y-4">
+        <form
+          ref={formRef}
+          onSubmit={(event) => void onSubmit(event)}
+          noValidate
+          className="mt-6 space-y-4"
+        >
           {isRegister && (
             <div>
-              <label htmlFor="auth-username" className="text-xs font-medium">
-                Nome de usuário
-              </label>
-              <input
+              <Label htmlFor="auth-username">Nome de usuário</Label>
+              <Input
                 id="auth-username"
                 name="username"
                 autoComplete="username"
-                autoFocus={isRegister}
-                required
-                minLength={3}
+                placeholder="Nome de usuário"
                 aria-invalid={fieldErrors.username ? true : undefined}
-                aria-describedby={fieldErrors.username ? 'username-error' : undefined}
-                className={inputClass}
+                aria-describedby={describe('username')}
+                className="mt-1.5"
               />
-              {fieldErrors.username && (
-                <p id="username-error" className="mt-1 text-xs text-kurio-danger">
-                  {fieldErrors.username}
-                </p>
-              )}
+              {renderFieldError('username')}
             </div>
           )}
           <div>
-            <label htmlFor="auth-email" className="text-xs font-medium">
-              E-mail
-            </label>
-            <input
+            <Label htmlFor="auth-email">E-mail</Label>
+            <Input
               id="auth-email"
               name="email"
               type="email"
               autoComplete="email"
-              autoFocus={!isRegister}
-              required
+              placeholder={isRegister ? 'Digite seu e-mail...' : 'contato@email.com'}
               aria-invalid={fieldErrors.email ? true : undefined}
-              aria-describedby={fieldErrors.email ? 'email-error' : undefined}
-              className={inputClass}
+              aria-describedby={describe('email')}
+              className="mt-1.5"
             />
-            {fieldErrors.email && (
-              <p id="email-error" className="mt-1 text-xs text-kurio-danger">
-                {fieldErrors.email}
-              </p>
-            )}
+            {renderFieldError('email')}
           </div>
           <div>
-            <label htmlFor="auth-password" className="text-xs font-medium">
-              Senha
-            </label>
+            <Label htmlFor="auth-password">Senha</Label>
             <div className="relative">
-              <input
+              <Input
                 id="auth-password"
                 name="password"
                 type={showPassword ? 'text' : 'password'}
                 autoComplete={isRegister ? 'new-password' : 'current-password'}
-                required
-                minLength={isRegister ? 8 : undefined}
+                placeholder={isRegister ? 'Senha' : undefined}
                 aria-invalid={fieldErrors.password ? true : undefined}
-                aria-describedby={fieldErrors.password ? 'password-error' : undefined}
-                className={`${inputClass} pr-12`}
+                aria-describedby={describe('password')}
+                className="mt-1.5 pr-12"
               />
               <button
                 type="button"
                 onClick={() => setShowPassword((visible) => !visible)}
                 aria-label={showPassword ? 'Ocultar senha' : 'Mostrar senha'}
-                className="absolute right-3 top-1/2 grid size-8 -translate-y-1/2 place-items-center rounded text-kurio-text-muted focus-visible:outline-2 focus-visible:outline-kurio-amber"
+                className="absolute right-3 top-1/2 mt-0.5 grid size-8 -translate-y-1/2 place-items-center rounded text-kurio-text-muted focus-visible:outline-2 focus-visible:outline-kurio-amber"
               >
-                {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                {showPassword ? <EyeOff size={16} aria-hidden="true" /> : <Eye size={16} aria-hidden="true" />}
               </button>
             </div>
-            {fieldErrors.password && (
-              <p id="password-error" className="mt-1 text-xs text-kurio-danger">
-                {fieldErrors.password}
-              </p>
-            )}
+            {renderFieldError('password')}
           </div>
           {isRegister && (
             <div>
-              <label htmlFor="auth-confirm-password" className="text-xs font-medium">
-                Confirmar senha
-              </label>
-              <input
+              <Label htmlFor="auth-confirm-password">Confirmar senha</Label>
+              <Input
                 id="auth-confirm-password"
                 name="confirmPassword"
                 type={showPassword ? 'text' : 'password'}
                 autoComplete="new-password"
-                required
+                placeholder="Confirmar senha"
                 aria-invalid={fieldErrors.confirmPassword ? true : undefined}
-                aria-describedby={fieldErrors.confirmPassword ? 'confirm-password-error' : undefined}
-                className={inputClass}
+                aria-describedby={describe('confirmPassword')}
+                className="mt-1.5"
               />
-              {fieldErrors.confirmPassword && (
-                <p id="confirm-password-error" className="mt-1 text-xs text-kurio-danger">
-                  {fieldErrors.confirmPassword}
-                </p>
-              )}
+              {renderFieldError('confirmPassword')}
+            </div>
+          )}
+          {!isRegister && (
+            <div className="text-right">
+              <button
+                type="button"
+                onClick={() => setInfo('A recuperação de senha não faz parte desta demonstração.')}
+                className="text-xs text-kurio-amber underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-kurio-amber"
+              >
+                Esqueceu a senha?
+              </button>
             </div>
           )}
           {formError && (
@@ -279,48 +276,53 @@ export function AuthModalOrPage({ mode }: { mode: AuthMode }) {
               {formError}
             </p>
           )}
-          <button
-            type="submit"
-            disabled={submitting}
-            className="h-12 w-full rounded-lg bg-kurio-amber text-sm font-bold text-kurio-bg hover:bg-kurio-amber-hover focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-kurio-amber disabled:opacity-60"
-          >
+          <Button type="submit" size="lg" disabled={submitting} className="h-12 w-full">
             {submitting
               ? 'Aguarde...'
               : isRegister
                 ? 'Criar perfil'
                 : 'Entrar'}
-          </button>
+          </Button>
         </form>
-        <div className="mt-6 grid gap-3 sm:grid-cols-2">
-          <button
-            type="button"
-            onClick={() => setFormError('A autenticação Google ficará disponível em uma próxima etapa.')}
-            className="rounded-lg border border-kurio-border px-3 py-3 text-xs text-kurio-text hover:border-kurio-amber focus-visible:outline-2 focus-visible:outline-kurio-amber"
+        <p className="mt-6 text-center text-[10px] uppercase tracking-wider text-kurio-text-muted">
+          Ou continue com
+        </p>
+        <div className="mt-3 grid gap-3 sm:grid-cols-2">
+          <Button
+            variant="secondary"
+            onClick={() => setInfo('O login com Google não faz parte desta demonstração.')}
+            className="py-3 font-normal"
           >
             Continuar com Google
-          </button>
-          <button
-            type="button"
-            onClick={() => setFormError('A autenticação Facebook ficará disponível em uma próxima etapa.')}
-            className="rounded-lg border border-kurio-border px-3 py-3 text-xs text-kurio-text hover:border-kurio-amber focus-visible:outline-2 focus-visible:outline-kurio-amber"
+          </Button>
+          <Button
+            variant="secondary"
+            onClick={() => setInfo('O login com Facebook não faz parte desta demonstração.')}
+            className="py-3 font-normal"
           >
             Continuar com Facebook
-          </button>
+          </Button>
         </div>
+        {info && (
+          <p role="status" className="mt-3 text-center text-xs text-kurio-text-muted">
+            {info}
+          </p>
+        )}
         <p className="mt-6 text-center text-xs text-kurio-text-muted">
           {isRegister ? 'Já tem uma conta?' : 'Ainda não tem uma conta?'}{' '}
           <Link
             to={isRegister ? '/login' : '/register'}
+            replace
             search={{
               ...(redirectPath ? { redirect: redirectPath } : {}),
-              ...(search.expired ? { expired: true } : {}),
+              ...(expired ? { expired: true } : {}),
             }}
-            className="font-semibold text-kurio-amber underline-offset-4 hover:underline"
+            className="font-semibold text-kurio-amber underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-kurio-amber"
           >
             {isRegister ? 'Entrar' : 'Criar perfil'}
           </Link>
         </p>
-      </section>
+      </Dialog>
     </main>
   )
 }
